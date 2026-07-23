@@ -161,21 +161,6 @@ OAuth 可處理：個人／工作帳戶選擇、保護帳戶、驗證電子郵�
 
 ---
 
-## 輸出與隱私
-
-請勿提交或分享含金鑰的檔案。常見本機檔案：
-
-```text
-config.json          # 真實代理與 temp_mail 金鑰
-Results/oauth2.txt   # 帳號與 refresh_token
-log/                 # 執行日誌
-browser_profiles/    # 暫存瀏覽器資料
-```
-
-文件與倉庫請使用 `config.example.json` 空白範本。
-
----
-
 ## 上游與致謝
 
 - [LainsNL/OutlookRegister](https://github.com/LainsNL/OutlookRegister) — 本專案二開來源  

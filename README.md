@@ -162,21 +162,6 @@ OAuth handles common intermediate pages: personal/work account chooser, protect-
 
 ---
 
-## Output and privacy
-
-Do **not** commit or share filled secrets. Gitignored / local-only examples:
-
-```text
-config.json          # your real proxy & temp_mail secrets
-Results/oauth2.txt   # accounts + refresh tokens
-log/                 # runtime logs
-browser_profiles/    # temporary browser data
-```
-
-Use `config.example.json` as the documented empty template.
-
----
-
 ## Upstream and acknowledgements
 
 - [LainsNL/OutlookRegister](https://github.com/LainsNL/OutlookRegister) — original project this fork is based on  
