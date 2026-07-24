@@ -179,4 +179,4 @@ Attribution retained for upstream OutlookRegister and MIT-licensed portions this
 
 ## Community
 
-- [linux.do](https://linux.do) — 新的理想型社区 / a thriving developer community.
+- [linux.do](https://linux.do): **Learn AI on L-Station!!!**

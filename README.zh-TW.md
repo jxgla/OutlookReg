@@ -176,6 +176,6 @@ OAuth 可處理：個人／工作帳戶選擇、保護帳戶、驗證電子郵�
 
 ---
 
-## 友情連結 / Community
+## 友情連結
 
-- [linux.do](https://linux.do) — 新的理想型社區 / a thriving developer community.
+- [linux.do](https://linux.do)：**學AI，上L站！！！**
