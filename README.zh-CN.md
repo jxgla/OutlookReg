@@ -173,3 +173,9 @@ OAuth 可处理：个人/工作帐户选择、保护帐户、验证电子邮件�
 
 本项目采用 [MIT License](./LICENSE)。  
 保留对上游 OutlookRegister 及所依赖 MIT 组件的署名说明。
+
+---
+
+## 友情链接 / Community
+
+- [linux.do](https://linux.do) — 新的理想型社区 / a thriving developer community.

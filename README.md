@@ -174,3 +174,9 @@ OAuth handles common intermediate pages: personal/work account chooser, protect-
 
 Distributed under the [MIT License](./LICENSE).  
 Attribution retained for upstream OutlookRegister and MIT-licensed portions this project builds on.
+
+---
+
+## Community
+
+- [linux.do](https://linux.do) — 新的理想型社区 / a thriving developer community.
