@@ -10,7 +10,9 @@ from controllers import dp_page as D
 # === OAuth2 常量（默认值，可被 config['oauth2'] 覆盖，见 configure_oauth2）===
 CLIENT_ID = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
 REDIRECT_URI = "https://localhost"
-SCOPE = "https://graph.microsoft.com/.default offline_access"
+AUTH_SCOPE = "https://graph.microsoft.com/.default offline_access"
+TOKEN_SCOPE = AUTH_SCOPE
+RT_SCOPE = "full"
 AUTHORIZE_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
 TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 
@@ -18,14 +20,13 @@ TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 def configure_oauth2(cfg):
     """用 config['oauth2'] 覆盖模块级 OAuth 常量（client_id / redirect_url / Scopes / tenant）。
 
-    启动时调用一次。返回实际生效的 {client_id, redirect_uri, scope, tenant}，供上层（如结果写入）同步。
-    授权与换 token 都读这些模块全局，覆盖后即全链路生效。
+    启动时调用一次。返回实际生效的 {client_id, redirect_uri, auth_scope, token_scope, rt_scope, tenant}，供上层（如结果写入）同步。
+    授权 URL 使用 auth_scope；拿 refresh_token 的 /token 兑换使用 token_scope，可按 rt_scope 从全量授权范围中切到 Graph 或 IMAP/SMTP。
 
-    tenant：授权/换 token 端点的租户段。本工具只注册个人 outlook.com 账号，默认 `consumers`
-    （个人账号专属端点，强制个人账号登录、无管理员 → 绕开学校/组织的管理员同意策略）。
-    可选 `common`（个人+组织）/`organizations`/具体 tenant id。
+    tenant：授权/换 token 端点的租户段。默认 `common`，可同时覆盖个人与组织类 Microsoft 帐户；
+    若你只希望个人账号，也可改成 `consumers`。其余可选 `organizations` / 具体 tenant id。
     """
-    global CLIENT_ID, REDIRECT_URI, SCOPE, AUTHORIZE_URL, TOKEN_URL
+    global CLIENT_ID, REDIRECT_URI, AUTH_SCOPE, TOKEN_SCOPE, RT_SCOPE, AUTHORIZE_URL, TOKEN_URL
     cfg = cfg or {}
     cid = str(cfg.get('client_id') or '').strip()
     if cid:
@@ -34,18 +35,52 @@ def configure_oauth2(cfg):
     if ru:
         REDIRECT_URI = ru
     scopes = cfg.get('Scopes') or cfg.get('scopes')
+    auth_scope = AUTH_SCOPE
     if isinstance(scopes, (list, tuple)):
         joined = ' '.join(str(s).strip() for s in scopes if str(s).strip())
         if joined:
-            SCOPE = joined
+            auth_scope = joined
     elif isinstance(scopes, str) and scopes.strip():
-        SCOPE = scopes.strip()
+        auth_scope = scopes.strip()
+    AUTH_SCOPE = auth_scope
+
+    graph_scopes = []
+    imap_scopes = []
+    common_scopes = []
+    for item in AUTH_SCOPE.split():
+        low = item.lower()
+        if 'graph.microsoft.com/' in low:
+            graph_scopes.append(item)
+        elif 'outlook.office.com/' in low:
+            imap_scopes.append(item)
+        else:
+            common_scopes.append(item)
+
+    rt_scope = str(cfg.get('rt_scope') or cfg.get('RTScope') or cfg.get('rtScope') or 'graph').strip().lower()
+    if rt_scope not in ('graph', 'imap'):
+        rt_scope = 'graph'
+    RT_SCOPE = rt_scope
+
+    if rt_scope == 'imap':
+        selected = imap_scopes
+    else:
+        selected = graph_scopes
+    token_parts = common_scopes + selected
+    TOKEN_SCOPE = ' '.join(part for part in token_parts if part).strip() or AUTH_SCOPE
+
     tenant = str(cfg.get('tenant') or cfg.get('authority') or '').strip().strip('/')
     if tenant:
         AUTHORIZE_URL = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize"
         TOKEN_URL = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
-    return {'client_id': CLIENT_ID, 'redirect_uri': REDIRECT_URI, 'scope': SCOPE,
-            'tenant': tenant or 'common', 'authorize_url': AUTHORIZE_URL}
+    return {
+        'client_id': CLIENT_ID,
+        'redirect_uri': REDIRECT_URI,
+        'auth_scope': AUTH_SCOPE,
+        'token_scope': TOKEN_SCOPE,
+        'rt_scope': RT_SCOPE,
+        'tenant': tenant or 'common',
+        'authorize_url': AUTHORIZE_URL,
+    }
 
 CONSENT_SELECTOR = '[data-testid="appConsentPrimaryButton"]'
 EMAIL_SELECTOR = "#i0116"
@@ -118,7 +153,7 @@ def build_auth_url(prefer_sso=True):
         'client_id': CLIENT_ID,
         'response_type': 'code',
         'redirect_uri': REDIRECT_URI,
-        'scope': SCOPE,
+        'scope': AUTH_SCOPE,
     }
     # 历史问题：sso_reload=true 会强制打断 cookie SSO，COOKIE 路径几乎必掉 #i0116
     if not prefer_sso:
@@ -1052,7 +1087,7 @@ def _exchange_code_once(code, proxy_url=None, timeout_sec=20):
             'code': code,
             'redirect_uri': REDIRECT_URI,
             'grant_type': 'authorization_code',
-            'scope': SCOPE,
+            'scope': TOKEN_SCOPE,
         },
         headers={'Content-Type': 'application/x-www-form-urlencoded'},
         timeout=timeout_sec,

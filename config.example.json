@@ -88,10 +88,22 @@
     "client_id": "9e5f94bc-e8a4-4e73-b8be-63364c29d753",
     // 重定向 URI
     "redirect_url": "http://localhost",
-    // 租户：consumers = 个人账号
-    "tenant": "consumers",
-    // 授权范围（一般 offline_access + Graph 默认范围）
-    "Scopes": ["offline_access", "openid", "profile", "https://graph.microsoft.com/User.Read", "https://graph.microsoft.com/Mail.ReadWrite", "https://graph.microsoft.com/Mail.Send"]
+    // 租户：common = 所有 Microsoft 帐户类型（个人+组织）
+    "tenant": "common",
+    // 授权范围（OAuth 页面仍使用这组全权限 scope；Graph 与 IMAP/SMTP 可同时出现）
+    "Scopes": [
+      "offline_access",
+      "https://outlook.office.com/IMAP.AccessAsUser.All",
+      "https://outlook.office.com/POP.AccessAsUser.All",
+      "https://outlook.office.com/SMTP.Send",
+      "https://graph.microsoft.com/Mail.Read",
+      "https://graph.microsoft.com/Mail.Send",
+      "https://graph.microsoft.com/User.Read",
+      "openid",
+      "profile"
+    ],
+    // 回调 code 换 refresh_token 时使用哪组 scope：graph / imap
+    "rt_scope": "graph"
   },
 
   // ===================== 辅助邮箱绑定 =====================

@@ -822,7 +822,11 @@ if __name__ == "__main__":
     # 用 config['oauth2'] 覆盖 OAuth 常量（client_id/redirect_url/Scopes），并回绑本模块 CLIENT_ID
     _oauth_applied = configure_oauth2(data.get('oauth2'))
     CLIENT_ID = _oauth_applied['client_id']
-    print(f"[OAuth] client_id={CLIENT_ID} tenant={_oauth_applied['tenant']} redirect_uri={_oauth_applied['redirect_uri']} scope={_oauth_applied['scope']}")
+    print(
+        f"[OAuth] client_id={CLIENT_ID} tenant={_oauth_applied['tenant']} "
+        f"redirect_uri={_oauth_applied['redirect_uri']} auth_scope={_oauth_applied['auth_scope']} "
+        f"token_scope={_oauth_applied['token_scope']} rt_scope={_oauth_applied['rt_scope']}"
+    )
 
     # 启动时先清掉上次异常残留的 profiles
     browser_cfg = data.get('browser') or {}
