@@ -97,22 +97,20 @@ def build_options(proxy_url=None, headless=False, window_size=None, browser_path
         '--lang=zh-CN',
         '--accept-lang=zh-CN,zh,en-US,en',
         '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
-        # 只保留噪音类特性关闭；保留 WebAuthn 能力（缺失可被探测）
-        # CalculateNativeWinOcclusion：关掉「窗口被遮挡/最小化即判定隐藏」的计算，
-        # 这样挂后台/最小化时 visibilityState 仍为 visible，验证码按压不被反爬当成隐藏页。
-        '--disable-features=Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider,'
-        'AutofillServerCommunication,PasswordManagerOnboarding,PasswordImport,'
-        'CalculateNativeWinOcclusion',
-        # 后台/最小化时仍全速运行（不节流定时器/渲染/被遮挡窗口）——保证挂后台也能正常按压验证码
-        '--disable-background-timer-throttling',
-        '--disable-backgrounding-occluded-windows',
-        '--disable-renderer-backgrounding',
-        '--disable-save-password-bubble',
-        '--disable-component-update',
         '--disable-sync',
+        '--disable-signin-promo',
+        '--disable-one-click-signin',
+        '--disable-account-consistency',
+        '--disable-features=IdentityDiscAccountMenu,SignInProfileCreation,SigninIntercept,ImproveSigninUI,ChromeSigninPromo,ChromeSigninFlow,Sync,ExplicitBrowserSignin,AccountConsistency,ExtensionsToolbarMenu,AutofillServerCommunication,PasswordManagerOnboarding,PasswordImport,Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider,CalculateNativeWinOcclusion',
+        '--disable-extensions',
         '--disable-default-apps',
         '--no-first-run',
         '--no-default-browser-check',
+        '--disable-save-password-bubble',
+        '--disable-component-update',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
     ]
     if window_size:
         base_args.append(f'--window-size={window_size[0]},{window_size[1]}')

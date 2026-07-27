@@ -141,23 +141,18 @@ AUTH_NAV_TIMEOUT_MS = 45000
 AUTH_ENTRY_TIMEOUT_MS = 45000
 
 
-def build_auth_url(prefer_sso=True):
-    """构造授权 URL。
-
-    prefer_sso=True（默认，COOKIE 路径）：
-      - 不加 sso_reload，尽量用注册会话静默登录直接到 consent
-    prefer_sso=False（NEW 冷启动）：
-      - 可加 prompt=login 强制账密（一般仍不建议；默认也不加）
-    """
+def build_auth_url(login_hint=''):
+    """构造授权 URL。OAuth 一律强制交互登录，避免静默吃本机/浏览器账号态。"""
     params = {
         'client_id': CLIENT_ID,
         'response_type': 'code',
         'redirect_uri': REDIRECT_URI,
         'scope': AUTH_SCOPE,
+        'prompt': 'login',
     }
-    # 历史问题：sso_reload=true 会强制打断 cookie SSO，COOKIE 路径几乎必掉 #i0116
-    if not prefer_sso:
-        params['sso_reload'] = 'true'
+    hint = str(login_hint or '').strip()
+    if hint:
+        params['login_hint'] = hint
     return f"{AUTHORIZE_URL}?{'&'.join(f'{k}={quote(v)}' for k, v in params.items())}"
 
 
@@ -392,7 +387,7 @@ def _handle_protect_account(page, log, temp_mail_cfg=None, failure_hook=None, al
     失败后才允许走 skip 兜底，避免把 OAuth 真正要求再次验证/绑定的页面直接跳掉。
     """
     if not _is_protect_account_page(page):
-        return _current_auth_entry_state(page)
+        return _current_auth_entry_state(page), None
 
     if already_bound:
         log('protect_account', '注册阶段已有 recovery 记录，但当前 OAuth 页仍要求处理，先按当前页继续绑定/验证', 'WARN')
@@ -401,17 +396,20 @@ def _handle_protect_account(page, log, temp_mail_cfg=None, failure_hook=None, al
 
     cfg = temp_mail_cfg or {}
     ok = False
+    session = None
     if cfg.get('enabled', True):
         try:
             from controllers.recovery_bind import bind_recovery_email
             result = bind_recovery_email(page, cfg, log=log, local_name=(current_email_local or None))
             if isinstance(result, tuple):
                 ok = bool(result[0])
+                session = result[1] if len(result) > 1 else None
             else:
                 ok = bool(result)
         except Exception as exc:
             log('protect_account', f'绑定异常: {_compact_exc(exc)}', 'FAIL')
             ok = False
+            session = None
 
     if ok:
         log('protect_account', 'OAuth 阶段备用邮箱绑定成功', 'OK')
@@ -434,10 +432,10 @@ def _handle_protect_account(page, log, temp_mail_cfg=None, failure_hook=None, al
     if ok and st == 'protect_account':
         try:
             if not _vis(page, '#EmailAddress') and not _vis(page, '#iOttText'):
-                return 'unknown'
+                return 'unknown', session
         except Exception:
             pass
-    return st
+    return st, session
 
 
 def _dump_auth_page(page, log, stage='auth_dump'):
@@ -853,7 +851,7 @@ def _dismiss_passkey_setup(page, log=None):
             pass
     # 最后：若仍在 fido 页，直接跳回我们的 authorize（依赖 cookie）
     try:
-        page.get(build_auth_url(prefer_sso=True))
+        page.get(build_auth_url(login_hint=full_email))
         page.wait(1.2)
         if log:
             log('passkey', '密钥页无法取消，已回跳 authorize', 'WARN')
@@ -900,22 +898,26 @@ def _digest_post_email_states(
     current_email_local='',
 ):
     """邮箱提交后可能出现的中间页：帐户类型 / 绑定保护 / 验证辅助邮箱 / 密钥 / KMSI。"""
+    session = recovery_session
     for _ in range(rounds):
         if state == 'account_type':
             state = _resolve_account_type(page, log, captured_code=captured_code)
             log('account_type', f'处理后状态={state}', 'INFO')
             continue
         if state == 'protect_account':
-            state = _handle_protect_account(
+            state, new_session = _handle_protect_account(
                 page, log, temp_mail_cfg=temp_mail_cfg, failure_hook=failure_hook,
                 already_bound=recovery_already_bound, current_email_local=current_email_local,
             )
+            if new_session:
+                session = new_session
+                recovery_already_bound = True
             log('protect_account', f'处理后状态={state}', 'INFO')
             continue
         if state == 'proof_verify':
             state = _handle_proof_verify(
                 page, log, temp_mail_cfg=temp_mail_cfg,
-                recovery_session=recovery_session, failure_hook=failure_hook,
+                recovery_session=session, failure_hook=failure_hook,
             )
             log('proof_verify', f'处理后状态={state}', 'INFO')
             continue
@@ -937,7 +939,7 @@ def _digest_post_email_states(
             except Exception:
                 pass
         break
-    return state
+    return state, session
 
 
 def _perform_login_after_cookie_fail(
@@ -945,7 +947,7 @@ def _perform_login_after_cookie_fail(
     captured_code=None, temp_mail_cfg=None, recovery_already_bound=False, recovery_session=None,
 ):
     current_email_local = (str(full_email or '').split('@', 1)[0]).strip()
-    state = _digest_post_email_states(
+    state, recovery_session = _digest_post_email_states(
         page, log, state, captured_code=captured_code, temp_mail_cfg=temp_mail_cfg,
         recovery_already_bound=recovery_already_bound, recovery_session=recovery_session,
         failure_hook=failure_hook, rounds=4, current_email_local=current_email_local,
@@ -967,7 +969,7 @@ def _perform_login_after_cookie_fail(
             state = _wait_for_auth_state_or_code(
                 page, captured_code, timeout_ms=AUTH_ENTRY_TIMEOUT_MS, ignore_states={'login_email'}
             )
-        state = _digest_post_email_states(
+        state, recovery_session = _digest_post_email_states(
             page, log, state, captured_code=captured_code, temp_mail_cfg=temp_mail_cfg,
             recovery_already_bound=recovery_already_bound, recovery_session=recovery_session,
             failure_hook=failure_hook, rounds=4, current_email_local=current_email_local,
@@ -976,28 +978,27 @@ def _perform_login_after_cookie_fail(
         if _has_unknown_account(page):
             _dump_auth_page(page, log)
             log('login_email', '邮箱不存在', 'FAIL')
-            return False
+            return False, recovery_session
         if state == 'login_email':
             if failure_hook:
                 failure_hook('oauth_login_timeout')
             _dump_auth_page(page, log)
             log('login_email', '邮箱页停留超时', 'FAIL')
-            return False
+            return False, recovery_session
 
-    state = _digest_post_email_states(
+    state, recovery_session = _digest_post_email_states(
         page, log, state, captured_code=captured_code, temp_mail_cfg=temp_mail_cfg,
         recovery_already_bound=recovery_already_bound, recovery_session=recovery_session,
         failure_hook=failure_hook, rounds=3,
     )
 
     if state == 'login_password':
-        # 冷登录验证辅助邮箱后，有时不必再输密码；若出现密码页再填
         if _has_password_login_blocked(page):
             if failure_hook:
                 failure_hook('oauth_password_blocked')
             _dump_auth_page(page, log)
             log('login_password', '密码登录不可用，跳过硬填', 'FAIL')
-            return False
+            return False, recovery_session
         log('login_password', '开始输入密码', 'WARN')
         _submit_password(page, password, log)
         if _has_password_login_blocked(page):
@@ -1005,24 +1006,24 @@ def _perform_login_after_cookie_fail(
                 failure_hook('oauth_password_blocked')
             _dump_auth_page(page, log)
             log('login_password', '检测到密码登录不可用', 'FAIL')
-            return False
+            return False, recovery_session
         if _has_invalid_password(page):
             if failure_hook:
                 failure_hook('oauth_password_wrong')
             _dump_auth_page(page, log)
             log('login_password', '检测到密码错误提示', 'FAIL')
-            return False
+            return False, recovery_session
         state = _wait_for_auth_state_or_code(
             page, captured_code, timeout_ms=AUTH_ENTRY_TIMEOUT_MS, ignore_states={'login_password'}
         )
-        state = _digest_post_email_states(
+        state, recovery_session = _digest_post_email_states(
             page, log, state, captured_code=captured_code, temp_mail_cfg=temp_mail_cfg,
             recovery_already_bound=recovery_already_bound, recovery_session=recovery_session,
             failure_hook=failure_hook, rounds=4, current_email_local=current_email_local,
         )
         log('login_password', f'密码提交后状态={state}', 'INFO')
         if state == 'code':
-            return True
+            return True, recovery_session
         if state != 'consent':
             if _has_password_login_blocked(page):
                 if failure_hook:
@@ -1039,41 +1040,39 @@ def _perform_login_after_cookie_fail(
                     failure_hook('oauth_consent_fail')
                 _dump_auth_page(page, log)
                 log('login_password', f'未进入同意页面 final_state={state}', 'FAIL')
-            return False
+            return False, recovery_session
 
-    # 冷登录常见：邮箱 → proof(codeEntry 自动验证) → kmsi 否 → consent（可能无密码页）
     if state in ('proof_verify', 'kmsi'):
-        state = _digest_post_email_states(
+        state, recovery_session = _digest_post_email_states(
             page, log, state, captured_code=captured_code, temp_mail_cfg=temp_mail_cfg,
             recovery_already_bound=recovery_already_bound, recovery_session=recovery_session,
             failure_hook=failure_hook, rounds=4, current_email_local=current_email_local,
         )
         log('proof_verify', f'proof/kmsi 处理后状态={state}', 'INFO')
         if state == 'login_password':
-            # 验证后若仍要密码，再走一轮
             if not _has_password_login_blocked(page):
                 log('login_password', 'proof 后出现密码页，继续填写', 'WARN')
                 _submit_password(page, password, log)
                 state = _wait_for_auth_state_or_code(
                     page, captured_code, timeout_ms=AUTH_ENTRY_TIMEOUT_MS, ignore_states={'login_password'}
                 )
-                state = _digest_post_email_states(
+                state, recovery_session = _digest_post_email_states(
                     page, log, state, captured_code=captured_code, temp_mail_cfg=temp_mail_cfg,
                     recovery_already_bound=recovery_already_bound, recovery_session=recovery_session,
                     failure_hook=failure_hook, rounds=3,
                 )
         if state == 'code':
-            return True
+            return True, recovery_session
         if state == 'consent':
-            return True
+            return True, recovery_session
         if state not in ('consent', 'code'):
             if failure_hook:
                 failure_hook('oauth_consent_fail')
             _dump_auth_page(page, log)
             log('proof_verify', f'验证后未进入同意页 final_state={state}', 'FAIL')
-            return False
+            return False, recovery_session
 
-    return state in ('consent', 'code')
+    return state in ('consent', 'code'), recovery_session
 
 
 def _exchange_code_once(code, proxy_url=None, timeout_sec=20):
@@ -1199,8 +1198,7 @@ def _exchange_captured_code(page, captured_code, log, failure_hook=None, current
 
 
 def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', backup_proxy=None, failure_hook=None, log_hook=None, current_proxy="", token_proxy_getter=None, temp_mail_cfg=None, recovery_already_bound=False, recovery_session=None):
-    # 同 context 必须 prefer_sso：不要 sso_reload，否则 cookie 会话被强制打断
-    auth_url = build_auth_url(prefer_sso=True)
+    auth_url = build_auth_url(login_hint=full_email)
     current_email_local = (str(full_email or '').split('@', 1)[0]).strip()
 
     def _log(stage, message, level='INFO'):
@@ -1211,7 +1209,7 @@ def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', ba
         print(f"{tag}[{level}] {time.strftime('%H:%M:%S')} | {stage} | {message}")
 
     def _try_flow():
-        _log('start', '开始 OAuth2 (同浏览器 context 复用 cookie，无 sso_reload)')
+        _log('start', '开始 OAuth2（同浏览器 context，强制交互登录）')
         # 同一 BrowserContext 新开 tab，共享注册后的 login.live.com cookie
         pg = page.browser.new_tab()
         D.prepare_tab(pg)
@@ -1234,10 +1232,13 @@ def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', ba
                 state = _resolve_account_type(pg, _log, captured_code=captured_code)
                 _log('entry', f'帐户类型处理后状态={state}')
             if state == 'protect_account':
-                state = _handle_protect_account(
+                state, new_recovery_session = _handle_protect_account(
                     pg, _log, temp_mail_cfg=temp_mail_cfg, failure_hook=failure_hook,
                     already_bound=recovery_already_bound, current_email_local=current_email_local,
                 )
+                if new_recovery_session:
+                    recovery_session = new_recovery_session
+                    recovery_already_bound = True
                 _log('entry', f'保护帐户处理后状态={state}')
             if state == 'proof_verify':
                 state = _handle_proof_verify(
@@ -1257,10 +1258,13 @@ def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', ba
                 if _is_account_type_page(pg):
                     state = _resolve_account_type(pg, _log, captured_code=captured_code)
                 elif _is_protect_account_page(pg):
-                    state = _handle_protect_account(
+                    state, new_recovery_session = _handle_protect_account(
                         pg, _log, temp_mail_cfg=temp_mail_cfg, failure_hook=failure_hook,
-                        already_bound=recovery_already_bound,
+                        already_bound=recovery_already_bound, current_email_local=current_email_local,
                     )
+                    if new_recovery_session:
+                        recovery_session = new_recovery_session
+                        recovery_already_bound = True
                 elif _is_proof_verify_page(pg):
                     state = _handle_proof_verify(
                         pg, _log, temp_mail_cfg=temp_mail_cfg,
@@ -1287,10 +1291,13 @@ def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', ba
             if state == 'account_type':
                 state = _resolve_account_type(pg, _log, captured_code=captured_code)
             if state == 'protect_account':
-                state = _handle_protect_account(
+                state, new_recovery_session = _handle_protect_account(
                     pg, _log, temp_mail_cfg=temp_mail_cfg, failure_hook=failure_hook,
                     already_bound=recovery_already_bound, current_email_local=current_email_local,
                 )
+                if new_recovery_session:
+                    recovery_session = new_recovery_session
+                    recovery_already_bound = True
             if state == 'proof_verify':
                 state = _handle_proof_verify(
                     pg, _log, temp_mail_cfg=temp_mail_cfg,
@@ -1300,7 +1307,7 @@ def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', ba
                 state = _handle_kmsi(pg, _log)
 
             if state in ('login_email', 'login_password', 'account_type', 'protect_account', 'proof_verify', 'kmsi'):
-                ok = _perform_login_after_cookie_fail(
+                ok, recovery_session = _perform_login_after_cookie_fail(
                     pg,
                     full_email,
                     password,
@@ -1313,9 +1320,9 @@ def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', ba
                     recovery_session=recovery_session,
                 )
                 if not ok:
-                    return False, None
+                    return False, None, recovery_session
                 state = _wait_for_auth_state_or_code(pg, captured_code, timeout_ms=8000)
-                state = _digest_post_email_states(
+                state, recovery_session = _digest_post_email_states(
                     pg, _log, state, captured_code=captured_code, temp_mail_cfg=temp_mail_cfg,
                     recovery_already_bound=recovery_already_bound, recovery_session=recovery_session,
                     failure_hook=failure_hook, rounds=3,
@@ -1323,7 +1330,7 @@ def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', ba
                 _log('entry', f'登录后阶段={state}', 'INFO')
 
             if state == 'code':
-                return _exchange_captured_code(
+                ok, token = _exchange_captured_code(
                     pg,
                     captured_code,
                     _log,
@@ -1331,8 +1338,9 @@ def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', ba
                     current_proxy=current_proxy,
                     token_proxy_getter=token_proxy_getter,
                 )
+                return ok, token, recovery_session
             if state == 'consent':
-                return _click_consent_and_exchange(
+                ok, token = _click_consent_and_exchange(
                     pg,
                     captured_code,
                     _log,
@@ -1340,15 +1348,16 @@ def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', ba
                     current_proxy=current_proxy,
                     token_proxy_getter=token_proxy_getter,
                 )
+                return ok, token, recovery_session
 
             if failure_hook:
                 failure_hook('oauth_consent_fail')
             _dump_auth_page(pg, _log)
             _log('entry', f'未进入同意或登录页面，最终状态={state}', 'FAIL')
-            return False, None
+            return False, None, recovery_session
         except Exception as e:
             _log('exception', f'异常: {_compact_exc(e)}', 'FAIL')
-            return False, None
+            return False, None, recovery_session
         finally:
             try:
                 pg.listen.stop()
@@ -1360,9 +1369,9 @@ def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', ba
                 pass
 
     try:
-        success, token = _try_flow()
+        success, token, recovery_session = _try_flow()
         if success:
-            return True, token
+            return True, token, recovery_session
     except Exception as e:
         _log('outer', f'首次尝试异常: {_compact_exc(e)}', 'FAIL')
-    return False, None
+    return False, None, recovery_session

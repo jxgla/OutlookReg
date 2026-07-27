@@ -1050,6 +1050,15 @@ class OutlookController:
         if not getattr(self.thread_local, 'recovery_email_bound', False):
             self.thread_local.recovery_email_skipped = True
 
+    def save_recovery_session(self, session, bound=True, skipped=False):
+        """OAuth 阶段若新绑定/确认了辅助邮箱，会话回写到当前线程结果。"""
+        if not session:
+            return False
+        self.thread_local.recovery_mail_session = session
+        self.thread_local.recovery_email_bound = bool(bound)
+        self.thread_local.recovery_email_skipped = bool(skipped)
+        return True
+
     def recovery_bind_status(self):
         """供 OAuth 判断：bound / skipped / session(address+jwt 冷登录接码用)。"""
         return {

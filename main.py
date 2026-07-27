@@ -128,11 +128,11 @@ def _login_and_get_token(page, email, password, prefix='', failure_hook=None, lo
     冷登录常见：邮箱 →「验证电子邮件」→ 发送验证码 → #codeEntry-0..5 自动验证
     → 保持登录「否」→ consent。需 recovery_session(address+jwt) 接码。
 
-    返回: (True, refresh_token) 或 (False, None)
+    返回: (True, refresh_token, recovery_session) 或 (False, None, recovery_session)
     """
     from controllers.oauth2 import _handle_protect_account, _handle_proof_verify, _handle_kmsi
-    # NEW 路径：若已注入注册 cookie，prefer_sso 有助于直接 consent；勿强制 sso_reload
-    auth_url = build_auth_url(prefer_sso=True)
+    # NEW 路径：OAuth 强制交互登录，避免静默吃本机/浏览器账号态
+    auth_url = build_auth_url(login_hint=email)
     captured_code = [None]
 
     def _log(stage, message, level='INFO'):
@@ -159,10 +159,13 @@ def _login_and_get_token(page, email, password, prefix='', failure_hook=None, lo
             state = _resolve_account_type(page, _log, captured_code=captured_code)
             _log('entry', f'帐户类型处理后状态={state}')
         if state == 'protect_account':
-            state = _handle_protect_account(
+            state, new_recovery_session = _handle_protect_account(
                 page, _log, temp_mail_cfg=temp_mail_cfg, failure_hook=failure_hook,
-                already_bound=recovery_already_bound,
+                already_bound=recovery_already_bound, current_email_local=(str(email or '').split('@', 1)[0]).strip(),
             )
+            if new_recovery_session:
+                recovery_session = new_recovery_session
+                recovery_already_bound = True
             _log('entry', f'保护帐户处理后状态={state}')
         if state == 'proof_verify':
             state = _handle_proof_verify(
@@ -179,7 +182,7 @@ def _login_and_get_token(page, email, password, prefix='', failure_hook=None, lo
 
         if state in ('login_email', 'login_password', 'account_type', 'protect_account', 'proof_verify', 'kmsi'):
             _log('entry', '新浏览器路径禁止 cookie recovery，直接进入登录流程', 'INFO')
-            ok = _perform_login_after_cookie_fail(
+            ok, recovery_session = _perform_login_after_cookie_fail(
                 page,
                 email,
                 password,
@@ -192,7 +195,7 @@ def _login_and_get_token(page, email, password, prefix='', failure_hook=None, lo
                 recovery_session=recovery_session,
             )
             if not ok:
-                return False, None
+                return False, None, recovery_session
             if captured_code[0]:
                 ok, refresh_token = _exchange_captured_code(
                     page,
@@ -203,18 +206,21 @@ def _login_and_get_token(page, email, password, prefix='', failure_hook=None, lo
                     token_proxy_getter=token_proxy_getter,
                 )
                 if not ok:
-                    return False, None
+                    return False, None, recovery_session
                 _log('token', 'token获取成功!', 'OK')
-                return True, refresh_token
+                return True, refresh_token, recovery_session
             # 登录后可能刚到 consent / 又弹出帐户类型 / 保护帐户 / proof
             state = _wait_for_auth_entry_state(page, timeout_ms=8000)
             if state == 'account_type':
                 state = _resolve_account_type(page, _log, captured_code=captured_code)
             if state == 'protect_account':
-                state = _handle_protect_account(
+                state, new_recovery_session = _handle_protect_account(
                     page, _log, temp_mail_cfg=temp_mail_cfg, failure_hook=failure_hook,
-                    already_bound=recovery_already_bound,
+                    already_bound=recovery_already_bound, current_email_local=(str(email or '').split('@', 1)[0]).strip(),
                 )
+                if new_recovery_session:
+                    recovery_session = new_recovery_session
+                    recovery_already_bound = True
             if state == 'proof_verify':
                 state = _handle_proof_verify(
                     page, _log, temp_mail_cfg=temp_mail_cfg,
@@ -234,9 +240,9 @@ def _login_and_get_token(page, email, password, prefix='', failure_hook=None, lo
                 token_proxy_getter=token_proxy_getter,
             )
             if not ok:
-                return False, None
+                return False, None, recovery_session
             _log('token', 'token获取成功!', 'OK')
-            return True, refresh_token
+            return True, refresh_token, recovery_session
 
         if state == 'consent':
             ok, refresh_token = _click_consent_and_exchange(
@@ -248,19 +254,19 @@ def _login_and_get_token(page, email, password, prefix='', failure_hook=None, lo
                 token_proxy_getter=token_proxy_getter,
             )
             if not ok:
-                return False, None
+                return False, None, recovery_session
             _log('token', 'token获取成功!', 'OK')
-            return True, refresh_token
+            return True, refresh_token, recovery_session
 
         if failure_hook:
             failure_hook('oauth_consent_fail')
         _dump_auth_page(page, _log)
         _log('entry', f'未进入同意或登录页面，最终状态={state}', 'FAIL')
-        return False, None
+        return False, None, recovery_session
 
     except Exception as e:
         _log('exception', f'异常: {e}', 'FAIL')
-        return False, None
+        return False, None, recovery_session
 
     finally:
         try:
@@ -370,7 +376,7 @@ def process_single_flow(controller, task_num=0, total=0):
             f"session_addr={(recovery_session or {}).get('address')}",
             attempt=1,
         )
-        oauth_ok, token = get_oauth2_token(
+        oauth_ok, token, oauth_recovery_session = get_oauth2_token(
             page,
             full_email,
             password,
@@ -386,6 +392,8 @@ def process_single_flow(controller, task_num=0, total=0):
 
         # 拿到 token 后立刻记进度（在 clean_up 之前）
         if oauth_ok:
+            if oauth_recovery_session:
+                controller.save_recovery_session(oauth_recovery_session)
             append_oauth_result(full_email, password, token, _aux_email_of(controller))
             controller.log_event('OAUTH_COOKIE', 'OK', 'finish', f"OAuth2 token获取成功 ({time.time()-t_start:.0f}s)", attempt=1)
             task_ok = True
@@ -393,12 +401,12 @@ def process_single_flow(controller, task_num=0, total=0):
             return True
 
         # COOKIE 路径失败：优先再同浏览器重试 1 次（多等 cookie），避免立刻丢掉 SSO
-        controller.log_event('OAUTH_COOKIE', 'WARN', 'retry_same', '同浏览器再试 OAuth 一次（沉淀 cookie 后）', attempt=1)
+        controller.log_event('OAUTH_COOKIE', 'WARN', 'retry_same', '同浏览器再试 OAuth 一次（强制重新登录）', attempt=1)
         try:
             page.wait(7.0)
         except Exception:
             pass
-        oauth_ok, token = get_oauth2_token(
+        oauth_ok, token, oauth_recovery_session = get_oauth2_token(
             page,
             full_email,
             password,
@@ -412,6 +420,8 @@ def process_single_flow(controller, task_num=0, total=0):
             recovery_session=controller.recovery_bind_status().get('session'),
         )
         if oauth_ok:
+            if oauth_recovery_session:
+                controller.save_recovery_session(oauth_recovery_session)
             append_oauth_result(full_email, password, token, _aux_email_of(controller))
             controller.log_event('OAUTH_COOKIE', 'OK', 'finish', f"OAuth2 token获取成功(同浏览器重试) ({time.time()-t_start:.0f}s)", attempt=2)
             task_ok = True
@@ -461,7 +471,7 @@ def process_single_flow(controller, task_num=0, total=0):
                         controller.log_event('OAUTH_NEW', 'INFO', 'cookie_import', f"已注入 cookies={len(storage_state or [])}", attempt=attempt)
                     except Exception as exc:
                         controller.log_event('OAUTH_NEW', 'WARN', 'cookie_import', f"注入 cookie 失败: {exc}", attempt=attempt)
-                ok, token = _login_and_get_token(
+                ok, token, oauth_recovery_session = _login_and_get_token(
                     page,
                     full_email,
                     password,
@@ -475,6 +485,8 @@ def process_single_flow(controller, task_num=0, total=0):
                     recovery_session=controller.recovery_bind_status().get('session'),
                 )
                 if ok:
+                    if oauth_recovery_session:
+                        controller.save_recovery_session(oauth_recovery_session)
                     append_oauth_result(full_email, password, token, _aux_email_of(controller))
                     controller.log_event('OAUTH_NEW', 'OK', 'finish', f"OAuth2 token获取成功 ({time.time()-t_start:.0f}s)", attempt=attempt)
                     task_ok = True
