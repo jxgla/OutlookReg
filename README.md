@@ -1,7 +1,7 @@
 <h1 align="center">OutlookRegister</h1>
 
 <p align="center">
-  Automated Outlook / Hotmail registration and Microsoft Graph OAuth2 <code>refresh_token</code> collection (browser automation via patchright).
+  Automated Outlook / Hotmail registration and Microsoft Graph OAuth2 <code>refresh_token</code> collection (browser automation via DrissionPage driving your local Chrome).
 </p>
 
 <p align="center">
@@ -13,7 +13,7 @@
 <p align="center">
   <img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white">
   <img alt="License MIT" src="https://img.shields.io/badge/License-MIT-green.svg">
-  <img alt="patchright" src="https://img.shields.io/badge/Browser-patchright-4B5563">
+  <img alt="DrissionPage" src="https://img.shields.io/badge/Browser-DrissionPage-4B5563">
   <img alt="Platform" src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-blue">
 </p>
 
@@ -36,7 +36,8 @@
 git clone <this-repo-url>
 cd OutlookRegister
 pip install -r requirements.txt
-patchright install chromium
+# No separate browser download needed; just ensure Google Chrome is installed.
+# If Chrome is not on the default path, set browser.path in config.json.
 ```
 
 ### 3. Configure
@@ -69,7 +70,7 @@ Logs are written under `log/`. Press **Ctrl+C** to stop; the process writes a su
 
 ## `config.json` field reference
 
-Ship template: `config.example.json` (same shape as the empty `config.json`).
+Ship template: `config.example.json` (same shape as the empty `config.json`). Both accept whole-line `//` comments (the loader strips them before parsing; a `.vscode/settings.json` maps them to JSONC so the editor won't flag them).
 
 ### Top-level
 
@@ -78,8 +79,9 @@ Ship template: `config.example.json` (same shape as the empty `config.json`).
 | `email_suffix` | string | Mail domain suffix used when generating accounts, e.g. `@outlook.com` or `@hotmail.com`. |
 | `headless` | bool | `false` = show browser windows; `true` = headless. |
 | `bot_protection_wait` | number | Base pacing for form fill (seconds). Code multiplies by 1000 for delays. |
-| `max_captcha_retries` | number | Extra press/retry rounds for the press-and-hold captcha (about `max_captcha_retries + 1` hold attempts). |
+| `max_captcha_retries` | number | Total press-and-hold attempts for the captcha (e.g. `2` = after two failed holds the current window is dropped; in `single` proxy mode the run ends, marking the IP unusable). |
 | `captcha_strategy` | number | Captcha / handoff mode (see table below). |
+| `px_solve_mode` | string | PerimeterX press-and-hold solver: `"hold"` (default, steady success rate) or `"a11y"` (accessibility fallback: click the accessibility icon → let the progress bar fill → click the bar). |
 | `concurrent_flows` | number | Concurrent worker threads (parallel browsers). |
 | `tasks` | number | Global cap on submitted tasks. Stops when this or `success_tasks` is reached (whichever first). |
 | `success_tasks` | number \| null | Global success cap. `null` = no success cap (still limited by `tasks`). |
@@ -100,7 +102,7 @@ Ship template: `config.example.json` (same shape as the empty `config.json`).
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `mode` | string | `single` = one port (`single_port`); `multiple` = port range `port_start`…`port_end`. |
+| `mode` | string | `single` = one port (`single_port`); `multiple` = port range `port_start`…`port_end`; `pool` = read proxies line by line from `pool_file` (auth socks5 supported, one proxy per window). |
 | `type` | string | Proxy scheme, e.g. `http`, `socks5`. |
 | `host` | string | Proxy host, e.g. `127.0.0.1`. **Fill this** before running. |
 | `single_port` | number | Port when `mode` is `single`. |
@@ -166,7 +168,7 @@ OAuth handles common intermediate pages: personal/work account chooser, protect-
 
 - [LainsNL/OutlookRegister](https://github.com/LainsNL/OutlookRegister) — original project this fork is based on  
 - [Microsoft identity platform / Graph](https://learn.microsoft.com/en-us/graph/auth-v2-user) — OAuth2 and Graph scopes  
-- [patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright) — browser automation  
+- [DrissionPage](https://github.com/g1879/DrissionPage) — browser automation (drives local Chrome)  
 
 ---
 

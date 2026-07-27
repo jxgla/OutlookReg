@@ -10,6 +10,7 @@ browser_profiles/
 # Local secrets & runtime data (never commit)
 config.json
 config.local.json
+proxypool.txt
 Results/
 !Results/.gitkeep
 

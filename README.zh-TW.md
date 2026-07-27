@@ -1,7 +1,7 @@
 <h1 align="center">OutlookRegister</h1>
 
 <p align="center">
-  Outlook / Hotmail 自動註冊，並取得 Microsoft Graph OAuth2 <code>refresh_token</code>（以 patchright 進行瀏覽器自動化）。
+  Outlook / Hotmail 自動註冊，並取得 Microsoft Graph OAuth2 <code>refresh_token</code>（以 DrissionPage 驅動本機 Chrome 進行瀏覽器自動化）。
 </p>
 
 <p align="center">
@@ -13,7 +13,7 @@
 <p align="center">
   <img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white">
   <img alt="License MIT" src="https://img.shields.io/badge/License-MIT-green.svg">
-  <img alt="patchright" src="https://img.shields.io/badge/Browser-patchright-4B5563">
+  <img alt="DrissionPage" src="https://img.shields.io/badge/Browser-DrissionPage-4B5563">
   <img alt="Platform" src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-blue">
 </p>
 
@@ -36,7 +36,8 @@
 git clone <本倉庫網址>
 cd OutlookRegister
 pip install -r requirements.txt
-patchright install chromium
+# 無需另外下載瀏覽器核心；確保本機已安裝 Chrome 即可
+# 若 Chrome 不在預設路徑，可於 config.json 的 browser.path 指定 chrome.exe
 ```
 
 ### 3. 設定
@@ -69,7 +70,7 @@ python main.py
 
 ## `config.json` 欄位說明
 
-範本見 `config.example.json`（與空白 `config.json` 結構相同）。
+範本見 `config.example.json`（與空白 `config.json` 結構相同）。兩個檔案都支援**整行 `//` 註解**（程式讀取時會先剝掉再解析；隨附 `.vscode/settings.json` 將其按 JSONC 處理，編輯器不再報錯）。
 
 ### 頂層欄位
 
@@ -78,8 +79,9 @@ python main.py
 | `email_suffix` | string | 註冊信箱後綴，如 `@outlook.com` 或 `@hotmail.com`。 |
 | `headless` | bool | `false` 顯示瀏覽器視窗；`true` 無頭。 |
 | `bot_protection_wait` | number | 填表節奏基準（秒）。程式內會 ×1000 作為等待。 |
-| `max_captcha_retries` | number | 驗證碼按壓額外重試次數（約 `max_captcha_retries + 1` 輪 Hold）。 |
+| `max_captcha_retries` | number | 驗證碼按壓總嘗試次數（如 `2` = 按壓兩次都不過就棄用當前視窗；single 模式則判定此IP不可用並結束執行）。 |
 | `captcha_strategy` | number | 驗證碼／交接策略，見下表。 |
+| `px_solve_mode` | string | PX「按住」驗證碼解法：`"hold"`（預設，成功率穩定）或 `"a11y"`（無障礙備用：點無障礙小人圖示→等進度條走完→點長條確認）。 |
 | `concurrent_flows` | number | 並發執行緒數（同時開啟的瀏覽器任務數）。 |
 | `tasks` | number | 全域提交任務上限；與 `success_tasks` **任一達標**即結束。 |
 | `success_tasks` | number \| null | 全域成功上限。`null` = 不依成功數截斷（仍受 `tasks` 限制）。 |
@@ -100,7 +102,7 @@ python main.py
 
 | 欄位 | 類型 | 說明 |
 | --- | --- | --- |
-| `mode` | string | `single` 使用 `single_port`；`multiple` 使用 `port_start`～`port_end` 連接埠池。 |
+| `mode` | string | `single` 使用 `single_port`；`multiple` 使用 `port_start`～`port_end` 連接埠池；`pool` 從 `pool_file` 順序讀代理（支援帳密 socks5，一視窗一代理）。 |
 | `type` | string | 代理協定，如 `http`、`socks5`。 |
 | `host` | string | 代理主機，如 `127.0.0.1`。**執行前請填寫。** |
 | `single_port` | number | `mode=single` 時的連接埠。 |
@@ -165,7 +167,7 @@ OAuth 可處理：個人／工作帳戶選擇、保護帳戶、驗證電子郵�
 
 - [LainsNL/OutlookRegister](https://github.com/LainsNL/OutlookRegister) — 本專案二開來源  
 - [Microsoft identity platform / Graph](https://learn.microsoft.com/en-us/graph/auth-v2-user) — OAuth2 與 Graph  
-- [patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright) — 瀏覽器自動化  
+- [DrissionPage](https://github.com/g1879/DrissionPage) — 瀏覽器自動化（驅動本機 Chrome）  
 
 ---
 

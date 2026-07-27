@@ -9,11 +9,12 @@ from controllers.oauth2 import (
     build_auth_url, _wait_for_auth_entry_state,
     _perform_login_after_cookie_fail, _click_consent_and_exchange, _exchange_captured_code,
     _settle_auth_page, _disable_auth_page_autofill, AUTH_NAV_TIMEOUT_MS, AUTH_ENTRY_TIMEOUT_MS,
-    _resolve_account_type, _dump_auth_page,
+    _resolve_account_type, _dump_auth_page, configure_oauth2, _is_login_email_page_loose,
 )
 from concurrent.futures import ThreadPoolExecutor
 from utils import random_email, generate_strong_password
 from controllers.outlook_controller import OutlookController
+from controllers import dp_page as D
 
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Results')  # 输出目录（oauth2.txt在此）
 RESULT_WRITE_LOCK = threading.Lock()
@@ -26,6 +27,8 @@ _RUNTIME = {
     'profiles_root': DEFAULT_BROWSER_PROFILES,
     'cleaned': False,
     'interrupt_requested': False,
+    'ip_bad': False,
+    'abort_reason': '',
 }
 
 
@@ -67,11 +70,55 @@ def interrupt_requested():
     return bool(_RUNTIME.get('interrupt_requested'))
 
 
-def append_oauth_result(email, password, refresh_token):
+def _mark_ip_bad(reason=''):
+    """标记需要收尾整次运行：single 模式出口IP判废，或代理池耗尽。像中断一样尽快收尾。"""
+    _RUNTIME['ip_bad'] = True
+    if reason:
+        _RUNTIME['abort_reason'] = reason
+
+
+def ip_bad_requested():
+    return bool(_RUNTIME.get('ip_bad'))
+
+
+def abort_reason():
+    return _RUNTIME.get('abort_reason') or '当前出口IP不可用'
+
+
+def append_oauth_result(email, password, refresh_token, aux_email=''):
+    """写一行结果。
+
+    - oauth2.txt：5 列，第 5 列为绑定的辅助邮箱（无则留空），便于溯源接码箱。
+    - accounts.txt：4 列增量凭据 email----password----clientid----refresh_token，
+      纯净可直接导入其它工具（和 oauth2.txt 同步写，成功一个记一个）。
+    """
     os.makedirs(RESULTS_DIR, exist_ok=True)
     with RESULT_WRITE_LOCK:
         with open(os.path.join(RESULTS_DIR, 'oauth2.txt'), 'a', encoding='utf-8') as f:
+            f.write(f"{email}----{password}----{CLIENT_ID}----{refresh_token}----{aux_email or ''}\n")
+        with open(os.path.join(RESULTS_DIR, 'accounts.txt'), 'a', encoding='utf-8') as f:
             f.write(f"{email}----{password}----{CLIENT_ID}----{refresh_token}\n")
+
+
+def append_registered_account(email, password):
+    """注册一成功即刻记录（不等 OAuth）。
+
+    保证即使后续 OAuth 失败/卡在 passkey，已在微软侧创建的可用账号也不丢。
+    写 Results/registered.txt：email----password----clientid（3 列，无 token）。
+    OAuth 最终成功的账号另见 accounts.txt（4 列带 refresh_token）。
+    """
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    with RESULT_WRITE_LOCK:
+        with open(os.path.join(RESULTS_DIR, 'registered.txt'), 'a', encoding='utf-8') as f:
+            f.write(f"{email}----{password}----{CLIENT_ID}\n")
+
+
+def _aux_email_of(controller):
+    """取本任务绑定的辅助邮箱地址（用于结果记录）；无则空串。"""
+    try:
+        return (controller.recovery_bind_status().get('session') or {}).get('address') or ''
+    except Exception:
+        return ''
 
 
 def _login_and_get_token(page, email, password, prefix='', failure_hook=None, log_hook=None, current_proxy='', token_proxy_getter=None, temp_mail_cfg=None, recovery_already_bound=False, recovery_session=None):
@@ -95,22 +142,12 @@ def _login_and_get_token(page, email, password, prefix='', failure_hook=None, lo
         tag = prefix if prefix else "[OAuth2:NEW]"
         print(f"{tag}[{level}] {time.strftime('%H:%M:%S')} | {stage} | {message}")
 
-    def on_request(request):
-        code = _extract_code_from_url(request.url)
-        if code:
-            captured_code[0] = code
-
-    def on_frame_navigated(frame):
-        code = _extract_code_from_url(frame.url)
-        if code:
-            captured_code[0] = code
-
-    page.on('request', on_request)
-    page.on('framenavigated', on_frame_navigated)
+    # 监听跳转到 localhost 的 OAuth 回调（含 code）
+    D.start_code_listen(page)
 
     try:
         _log('start', '开始 OAuth2 (新浏览器+新IP)')
-        page.goto(auth_url, timeout=AUTH_NAV_TIMEOUT_MS, wait_until="domcontentloaded")
+        page.get(auth_url)
         _settle_auth_page(page, _log, 'goto')
         _disable_auth_page_autofill(page, _log)
         _log('goto', '进入auth页面')
@@ -136,6 +173,9 @@ def _login_and_get_token(page, email, password, prefix='', failure_hook=None, lo
         if state == 'kmsi':
             state = _handle_kmsi(page, _log)
             _log('entry', f'kmsi 处理后状态={state}')
+        if state == 'unknown' and _is_login_email_page_loose(page):
+            state = 'login_email'
+            _log('entry', 'unknown 实为邮箱登录页：同页补登当前邮箱', 'WARN')
 
         if state in ('login_email', 'login_password', 'account_type', 'protect_account', 'proof_verify', 'kmsi'):
             _log('entry', '新浏览器路径禁止 cookie recovery，直接进入登录流程', 'INFO')
@@ -223,8 +263,10 @@ def _login_and_get_token(page, email, password, prefix='', failure_hook=None, lo
         return False, None
 
     finally:
-        page.remove_listener('request', on_request)
-        page.remove_listener('framenavigated', on_frame_navigated)
+        try:
+            page.listen.stop()
+        except Exception:
+            pass
 
 
 def process_single_flow(controller, task_num=0, total=0):
@@ -248,16 +290,53 @@ def process_single_flow(controller, task_num=0, total=0):
         controller.set_task_prefix(task_num, total)
         page = controller.get_thread_page()
         if not page:
-            controller.log_event('REGISTER', 'FAIL', 'bootstrap', "浏览器页面创建失败，跳过当前任务")
+            if controller.pool_exhausted():
+                controller.log_event('REGISTER', 'FAIL', 'pool',
+                                     "代理池已耗尽（全部不可用），结束本次运行")
+                _mark_ip_bad('代理池已耗尽（全部不可用）')
+            else:
+                controller.log_event('REGISTER', 'FAIL', 'bootstrap', "浏览器页面创建失败，跳过当前任务")
             _note(False)
             return False
-        current_proxy = getattr(controller.thread_local, '_proxy', '')
+        current_proxy = controller.current_requests_proxy()
+
+        # 人机验证：按压重试已在 handle_captcha 内按 max_captcha_retries 执行（试满即弃窗），
+        # 这里不再「同IP整体重跑」——同一出口IP重跑基本不会过，只是白白多试几倍。
+        # 失败后：single 模式出口IP固定 → 判定此IP不可用并结束运行；
+        #         pool/端口模式 → 记录坏IP、丢弃当前窗口、继续下一个任务。
         email = random_email()
         password = generate_strong_password()
-        controller.log_event('REGISTER', 'INFO', 'account', f"Generate {email}{controller.email_suffix}")
-
+        controller.log_event(
+            'REGISTER', 'INFO', 'account',
+            f"Generate {email}{controller.email_suffix}",
+        )
         # 注册微软邮箱: True / False / 'handed_off'(策略2 仅到验证码后交由人工)
         result = controller.outlook_register(page, email, password)
+        if (not result
+                and getattr(controller.thread_local, '_last_fail_stage', None) == 'captcha'):
+            _tries = max(1, controller.max_captcha_retries)
+            if controller.is_single_proxy_mode():
+                controller.log_event(
+                    'REGISTER', 'FAIL', 'ip_bad',
+                    f"人机验证 {_tries} 次均未通过，判定【此IP不可用】，结束本次运行",
+                )
+                _mark_ip_bad('当前出口IP无法通过人机验证，判定【此IP不可用】')
+            else:
+                bad_ip = controller.current_exit_ip()
+                controller.record_bad_exit_ip(bad_ip)
+                controller.log_event(
+                    'REGISTER', 'FAIL', 'ip_bad',
+                    f"人机验证 {_tries} 次均未通过，记录坏IP({bad_ip or '未知'})并跳过，"
+                    f"丢弃当前窗口、继续下一个",
+                )
+
+        # 注册成功即刻落盘（handed_off / oauth / 非oauth 都算创建成功），
+        # 保证后续 OAuth 卡 passkey/失败时，已创建账号不丢失
+        if result:
+            try:
+                append_registered_account(f"{email}{controller.email_suffix}", password)
+            except Exception:
+                pass
 
         # 策略 2：只自动到验证码界面，过码 + OAuth 全由人工，程序不再跑 OAuth
         if result == 'handed_off':
@@ -307,7 +386,7 @@ def process_single_flow(controller, task_num=0, total=0):
 
         # 拿到 token 后立刻记进度（在 clean_up 之前）
         if oauth_ok:
-            append_oauth_result(full_email, password, token)
+            append_oauth_result(full_email, password, token, _aux_email_of(controller))
             controller.log_event('OAUTH_COOKIE', 'OK', 'finish', f"OAuth2 token获取成功 ({time.time()-t_start:.0f}s)", attempt=1)
             task_ok = True
             _note(True)
@@ -316,7 +395,7 @@ def process_single_flow(controller, task_num=0, total=0):
         # COOKIE 路径失败：优先再同浏览器重试 1 次（多等 cookie），避免立刻丢掉 SSO
         controller.log_event('OAUTH_COOKIE', 'WARN', 'retry_same', '同浏览器再试 OAuth 一次（沉淀 cookie 后）', attempt=1)
         try:
-            page.wait_for_timeout(7000)
+            page.wait(7.0)
         except Exception:
             pass
         oauth_ok, token = get_oauth2_token(
@@ -333,18 +412,18 @@ def process_single_flow(controller, task_num=0, total=0):
             recovery_session=controller.recovery_bind_status().get('session'),
         )
         if oauth_ok:
-            append_oauth_result(full_email, password, token)
+            append_oauth_result(full_email, password, token, _aux_email_of(controller))
             controller.log_event('OAUTH_COOKIE', 'OK', 'finish', f"OAuth2 token获取成功(同浏览器重试) ({time.time()-t_start:.0f}s)", attempt=2)
             task_ok = True
             _note(True)
             return True
 
-        # 仍失败：导出 storage_state 再开新浏览器注入 cookie（比纯空浏览器好）
+        # 仍失败：导出 cookie 再开新浏览器注入（比纯空浏览器好）
         # 注意：纯 NEW 无 cookie 时常见「找不到帐户 / 密码登录不可用 / 密钥页」
         storage_state = None
         try:
-            storage_state = page.context.storage_state()
-            controller.log_event('OAUTH_NEW', 'INFO', 'cookie_export', f"已导出 storage_state cookies={len(storage_state.get('cookies') or [])}")
+            storage_state = controller.export_cookies(page)
+            controller.log_event('OAUTH_NEW', 'INFO', 'cookie_export', f"已导出 cookies={len(storage_state or [])}")
         except Exception as exc:
             controller.log_event('OAUTH_NEW', 'WARN', 'cookie_export', f"导出 cookie 失败: {exc}")
 
@@ -373,8 +452,13 @@ def process_single_flow(controller, task_num=0, total=0):
                 if storage_state:
                     try:
                         # 注入注册会话 cookie，避免「找不到该用户名」的冷启动
-                        page.context.add_cookies(storage_state.get('cookies') or [])
-                        controller.log_event('OAUTH_NEW', 'INFO', 'cookie_import', f"已注入 cookies={len(storage_state.get('cookies') or [])}", attempt=attempt)
+                        # DP 需先落到域再注入：先访问 login.live.com 建立上下文
+                        try:
+                            page.get('https://login.live.com/')
+                        except Exception:
+                            pass
+                        controller.inject_cookies(page, storage_state)
+                        controller.log_event('OAUTH_NEW', 'INFO', 'cookie_import', f"已注入 cookies={len(storage_state or [])}", attempt=attempt)
                     except Exception as exc:
                         controller.log_event('OAUTH_NEW', 'WARN', 'cookie_import', f"注入 cookie 失败: {exc}", attempt=attempt)
                 ok, token = _login_and_get_token(
@@ -384,14 +468,14 @@ def process_single_flow(controller, task_num=0, total=0):
                     prefix=controller._log_prefix_str(),
                     failure_hook=controller.bump_failure,
                     log_hook=controller.make_logger('OAUTH_NEW', attempt=attempt),
-                    current_proxy=getattr(controller.thread_local, '_proxy', ''),
+                    current_proxy=controller.current_requests_proxy(),
                     token_proxy_getter=lambda exclude='': controller.fresh_proxy_url(exclude=exclude),
                     temp_mail_cfg=getattr(controller, 'temp_mail_cfg', None),
                     recovery_already_bound=controller.recovery_bind_status()['bound'],
                     recovery_session=controller.recovery_bind_status().get('session'),
                 )
                 if ok:
-                    append_oauth_result(full_email, password, token)
+                    append_oauth_result(full_email, password, token, _aux_email_of(controller))
                     controller.log_event('OAUTH_NEW', 'OK', 'finish', f"OAuth2 token获取成功 ({time.time()-t_start:.0f}s)", attempt=attempt)
                     task_ok = True
                     _note(True)
@@ -453,7 +537,7 @@ def build_summary_lines(controller, tasks, succeeded_tasks, failed_tasks, elapse
         f"[Breakdown] 浏览器启动失败:  {fs['browser_launch_fail']:>3}个",
         f"[Breakdown] Context创建失败: {fs['browser_context_fail']:>3}个",
         f"[Breakdown] Page创建失败:    {fs['browser_page_fail']:>3}个",
-        f"[Breakdown] Playwright异常:  {fs['playwright_runtime_fail']:>3}个",
+        f"[Breakdown] 浏览器运行异常:  {fs['playwright_runtime_fail']:>3}个",
         f"[Breakdown] 邮箱未初始化:    {fs['mail_init_fail']:>3}个",
         f"[Breakdown] OAuth登录超时:   {fs['oauth_login_timeout']:>3}个",
         f"[Breakdown] OAuth同意失败:   {fs['oauth_consent_fail']:>3}个",
@@ -610,6 +694,11 @@ def run_concurrent_flows(
                 stop_submit = True
             if task_counter >= tasks:
                 stop_submit = True
+            if ip_bad_requested() and not stop_submit:
+                stop_submit = True
+                controller.log_plain(
+                    f"[Batch][WARN] {abort_reason()}，停止提交新任务并收尾在途"
+                )
 
             if not stop_submit:
                 # 只按已完成成功数判断，允许并发略超 batch 目标，避免「成功+在途」预占卡死
@@ -730,6 +819,11 @@ if __name__ == "__main__":
     lines = [line for line in raw.split('\n') if not line.strip().startswith('//')]
     data = json.loads('\n'.join(lines))
 
+    # 用 config['oauth2'] 覆盖 OAuth 常量（client_id/redirect_url/Scopes），并回绑本模块 CLIENT_ID
+    _oauth_applied = configure_oauth2(data.get('oauth2'))
+    CLIENT_ID = _oauth_applied['client_id']
+    print(f"[OAuth] client_id={CLIENT_ID} tenant={_oauth_applied['tenant']} redirect_uri={_oauth_applied['redirect_uri']} scope={_oauth_applied['scope']}")
+
     # 启动时先清掉上次异常残留的 profiles
     browser_cfg = data.get('browser') or {}
     profiles_root = (browser_cfg.get('user_data_root') or '').strip() or DEFAULT_BROWSER_PROFILES
@@ -780,8 +874,23 @@ if __name__ == "__main__":
             if batch_index == 1:
                 selected_controller.log_plain(f"[Log] 本次日志文件: {selected_controller.log_path}")
                 selected_controller.log_plain(
-                    "[Batch] 代理为固定出口 IP；批次重启仅刷新程序内权重/统计，不会更换外部出口 IP"
+                    f"[Cfg] px_solve_mode={selected_controller.px_solve_mode}"
+                    f"（hold=按住长条 / a11y=无障碍备用）"
+                    f" | 并发={concurrent_flows} tasks={tasks} captcha_strategy={selected_controller.captcha_strategy}"
                 )
+                if selected_controller.is_pool_proxy_mode():
+                    selected_controller.log_plain(
+                        "[Batch] pool 模式：一窗口一代理（本地转发器链，经前置代理出墙），"
+                        "坏IP/坏代理本 run 内跳过、结束后释放"
+                    )
+                elif selected_controller.is_single_proxy_mode():
+                    selected_controller.log_plain(
+                        "[Batch] 代理为固定出口 IP；批次重启仅刷新程序内权重/统计，不会更换外部出口 IP"
+                    )
+                else:
+                    selected_controller.log_plain(
+                        "[Batch] 端口池模式：每任务从端口池按权重取一条出口；批次重启刷新程序内权重/统计"
+                    )
                 selected_controller.log_plain(
                     f"[Batch] 全局结束条件: tasks={tasks} 或 success_tasks="
                     f"{success_tasks if success_tasks is not None else 'null(不限)'} 任一达标即停; "
@@ -876,6 +985,12 @@ if __name__ == "__main__":
                 pass
             _RUNTIME['cleaned'] = True
 
+            if ip_bad_requested():
+                selected_controller.log_plain(
+                    f"[Batch] stop: {abort_reason()}，结束运行"
+                )
+                break
+
             if success_tasks is not None and total_succeeded >= success_tasks:
                 selected_controller.log_plain(
                     f"[Batch] stop: success_tasks 达标 ({total_succeeded}/{success_tasks})"
@@ -938,5 +1053,10 @@ if __name__ == "__main__":
         # 始终清理浏览器与 profiles（汇总应已在上面写完）
         try:
             _cleanup_browser_profiles_on_exit()
+        except Exception:
+            pass
+        # pool 模式：释放本 run 的坏IP/坏代理记录（下次运行从干净状态开始）
+        try:
+            OutlookController.release_proxy_pool()
         except Exception:
             pass

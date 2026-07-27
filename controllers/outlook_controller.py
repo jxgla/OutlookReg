@@ -1,11 +1,14 @@
 import os
+import json
 import time
 import random
 import math
 import shutil
 import threading
 from faker import Faker
-from patchright.sync_api import sync_playwright
+
+from controllers import dp_page as D
+from controllers.proxy_pool import ProxyPool, LocalForwarder
 
 
 class OutlookController:
@@ -20,6 +23,7 @@ class OutlookController:
     # === 类变量（所有线程共享）===
     _proxy_usage = {}      # 每个代理端口被选中的次数
     _proxy_config = None   # 代理配置缓存（只解析一次）
+    _proxy_pool = None     # pool 模式：ProxyPool 单例（按 proxypool.txt 构建一次）
     _ip_tracker = {}       # IP表现追踪（仅内存，不持久化）
     _attempts = 0          # 累计验证码尝试次数
     _success = 0           # 累计验证码成功次数
@@ -48,17 +52,31 @@ class OutlookController:
         self.wait_time = config_data['bot_protection_wait'] * 1000  # 秒→毫秒
         self.max_captcha_retries = config_data['max_captcha_retries']
         self.captcha_strategy = config_data.get('captcha_strategy', 0)
+        # PX「按住」验证码解法：'hold'=按住长条(默认，成功率稳定) / 'a11y'=无障碍备用(点小人图标→等进度条走完→点长条)
+        # 容忍常见别名/手误：ally、accessibility、无障碍 都归一为 'a11y'
+        _pm = str(config_data.get('px_solve_mode', 'hold')).strip().lower()
+        self.px_solve_mode = 'a11y' if _pm in ('a11y', 'ally', 'accessibility', 'a11y-fallback', '无障碍') else 'hold'
         self.enable_oauth2 = config_data["oauth2"]['enable_oauth2']
         self.headless = config_data.get('headless', False)
         self.email_suffix = config_data['email_suffix']
 
-        # 公开发行版：固定 patchright 自带 Chromium，不使用指纹/自定义浏览器
+        # DrissionPage：驱动本机真实 Chrome（反检测优于 bundled Chromium）
         browser_cfg = config_data.get('browser', {}) or {}
-        self.browser_executable_path = ''  # 强制空 → patchright builtin
-        self.fingerprint_enabled = False
-        self.fingerprint_platform = 'windows'
-        self.fingerprint_brand = 'Chrome'
+        # 可选：指定 chrome/edge 可执行文件路径；留空 → DP 自动探测系统 Chrome
+        self.browser_path = (browser_cfg.get('path') or browser_cfg.get('channel') or '').strip() or None
+        # 固定窗口尺寸档位（inner/outer 一致，避免 viewport 随机化指纹）
+        ws = browser_cfg.get('window_size')
+        if isinstance(ws, (list, tuple)) and len(ws) == 2:
+            self._window_sizes = [(int(ws[0]), int(ws[1]))]
+        else:
+            self._window_sizes = [(1366, 768), (1440, 900), (1536, 864), (1920, 1080)]
         user_data_root = (browser_cfg.get('user_data_root') or '').strip()
+        # 有头时挂后台：启动后最小化窗口，不抢占前台/焦点（仍是真实 Chrome，反检测不变）。
+        # headless 下无窗口，此项无意义。
+        self.background_window = bool(browser_cfg.get('background', False))
+        # 禁用图片加载省流量（Blink 层 imagesEnabled=false，图片根本不发请求）。
+        # 注：表单/按钮/PX按压不依赖图片，一般不影响流程；若某些页面异常可关掉。
+        self.block_images = bool(browser_cfg.get('block_images', False))
         self.browser_user_data_root = user_data_root or os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             'browser_profiles',
@@ -74,16 +92,14 @@ class OutlookController:
         self.runtime_lock = threading.Lock()
         self.log_lock = threading.Lock()
         self.active_resources = []
-        self.active_playwrights = []
+        self.active_forwarders = []   # pool 模式：本地转发器（跨线程，程序结束统一 stop）
         self.log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'log')
         os.makedirs(self.log_dir, exist_ok=True)
-        if self.fingerprint_enabled or self.browser_executable_path:
-            os.makedirs(self.browser_user_data_root, exist_ok=True)
         self.log_path = os.path.join(
             self.log_dir,
             f"{time.strftime('%Y-%m-%d_%H-%M-%S')}_{os.getpid()}.txt"
         )
-        self.log_plain("[Browser] mode=patchright-chromium (builtin) fingerprint=false")
+        self.log_plain("[Browser] mode=drissionpage (system Chrome) stealth=screenX+force")
         self.runtime_stats = {
             'started_at': time.time(),
             'submitted': 0,
@@ -126,29 +142,40 @@ class OutlookController:
     # IP 信息查询（国家 + 时区 + 坐标，带缓存）
     # ============================================================
     @classmethod
-    def _get_ip_info(cls, proxy_url):
-        """查询代理IP的地理信息：国家代码、时区、GPS坐标。结果缓存，同一代理只查一次。"""
-        if not proxy_url:
-            return {'country': '??', 'timezone': 'UTC', 'loc': None}
-        with cls._state_lock:
-            if proxy_url in cls._ip_info_cache:
-                return cls._ip_info_cache[proxy_url]
-        info = {'country': '??', 'timezone': 'UTC', 'loc': None}
+    def _get_ip_info(cls, proxy_url, requests_proxy_url=None, timeout=3, use_cache=True):
+        """查询代理IP的地理信息：出口IP、国家代码、时区、GPS坐标。
+
+        - proxy_url：缓存键 & 兜底的 requests 代理。
+        - requests_proxy_url：实际给 requests 用的代理（pool 传本地转发器 socks5h 口以测**完整链路**）。
+        连不通/失败时返回 ip=None，上层据此判连通性。
+        """
+        if not proxy_url and not requests_proxy_url:
+            return {'country': '??', 'timezone': 'UTC', 'loc': None, 'ip': None}
+        req_url = requests_proxy_url or proxy_url
+        cache_key = proxy_url or requests_proxy_url
+        if use_cache:
+            with cls._state_lock:
+                if cache_key in cls._ip_info_cache:
+                    return cls._ip_info_cache[cache_key]
+        info = {'country': '??', 'timezone': 'UTC', 'loc': None, 'ip': None}
         try:
             import requests
-            r = requests.get('https://ipinfo.io/json', proxies={'https': proxy_url},
-                             timeout=3, headers={'Accept': 'application/json'})
+            r = requests.get('https://ipinfo.io/json',
+                             proxies={'http': req_url, 'https': req_url},
+                             timeout=timeout, headers={'Accept': 'application/json'})
             if r.status_code == 200:
                 d = r.json()
                 info = {
                     'country': d.get('country', '??'),
                     'timezone': d.get('timezone', 'UTC'),
                     'loc': d.get('loc', None),  # "35.68,139.76"
+                    'ip': d.get('ip', None),
                 }
         except Exception:
             pass
-        with cls._state_lock:
-            cls._ip_info_cache[proxy_url] = info
+        if use_cache:
+            with cls._state_lock:
+                cls._ip_info_cache[cache_key] = info
         return info
 
     def bump_failure(self, *names):
@@ -157,6 +184,7 @@ class OutlookController:
                 self.failure_stats[name] = self.failure_stats.get(name, 0) + 1
 
     def _reset_thread_runtime(self):
+        self._stop_thread_forwarder()
         for attr in ('_proxy', '_ip_info', '_log_prefix'):
             if hasattr(self.thread_local, attr):
                 delattr(self.thread_local, attr)
@@ -174,7 +202,11 @@ class OutlookController:
     def set_task_prefix(self, task_num, total):
         """设置当前线程的日志前缀： [编号/总-国家-IP] 并缓存IP地理信息"""
         proxy, info = self.prepare_thread_context()
-        ip_short = proxy.split('//')[-1] if '//' in proxy else proxy
+        exit_ip = getattr(self.thread_local, '_exit_ip', None)
+        if exit_ip:
+            ip_short = exit_ip   # pool：显示真实出口 IP，而非本地转发器端口
+        else:
+            ip_short = proxy.split('//')[-1] if '//' in proxy else proxy
         self.thread_local._log_prefix = f"[{task_num}/{total}-{info['country']}-{ip_short}]"
 
     def log_event(self, flow, level, stage, message, attempt=None):
@@ -291,6 +323,9 @@ class OutlookController:
             self.log_event('PROXY', 'WARN', 'penalize', f"{key} 惩罚 +{penalty}")
 
     def fresh_proxy_url(self, exclude: str = "") -> str:
+        # pool 模式：每任务已独占一条出口，token 重试复用当前本地转发器（socks5h 远端DNS，过墙）。
+        if (self._proxy_config or {}).get('mode') == 'pool':
+            return self.current_requests_proxy()
         previous_proxy = getattr(self.thread_local, '_proxy', None)
         previous_info = getattr(self.thread_local, '_ip_info', None)
         try:
@@ -321,21 +356,9 @@ class OutlookController:
         with self.cleanup_lock:
             self.active_resources = [item for item in self.active_resources if item is not browser]
 
-    def _register_active_playwright(self, playwright):
-        with self.cleanup_lock:
-            self.active_playwrights.append(playwright)
-
-    def _unregister_active_playwright(self, playwright):
-        with self.cleanup_lock:
-            self.active_playwrights = [item for item in self.active_playwrights if item is not playwright]
-
     @staticmethod
     def _browser_failure_key(stage, message):
         msg = (message or "").lower()
-        if stage == 'playwright':
-            return 'playwright_runtime_fail'
-        if 'event loop is closed' in msg or 'playwright already stopped' in msg or 'asyncio loop' in msg:
-            return 'playwright_runtime_fail'
         if stage == 'launch':
             return 'browser_launch_fail'
         if stage == 'context':
@@ -349,66 +372,56 @@ class OutlookController:
         self.log_event('BROWSER', 'FAIL', stage, f"{message} | class={failure_key}")
         return failure_key
 
-    def _dispose_thread_playwright(self):
-        playwright = getattr(self.thread_local, 'playwright', None)
-        if not playwright:
-            return
-        try:
-            playwright.stop()
-        except Exception:
-            pass
-        self._unregister_active_playwright(playwright)
-        try:
-            del self.thread_local.playwright
-        except Exception:
-            pass
-
     def _dispose_thread_browser(self):
         browser = getattr(self.thread_local, 'browser', None)
-        if not browser:
-            return
-        try:
-            browser.close()
-        except Exception:
-            pass
-        self._unregister_active_browser(browser)
-        try:
-            del self.thread_local.browser
-        except Exception:
-            pass
-
-    def _thread_playwright(self):
-        playwright = getattr(self.thread_local, 'playwright', None)
-        if playwright:
-            return playwright
-        try:
-            playwright = sync_playwright().start()
-        except Exception as exc:
-            self._log_browser_failure('playwright', exc)
-            return None
-        self.thread_local.playwright = playwright
-        self._register_active_playwright(playwright)
-        self.log_event('BROWSER', 'INFO', 'playwright', '线程级 Playwright 已初始化')
-        return playwright
+        if browser:
+            try:
+                browser.quit(timeout=5, force=True, del_data=True)
+            except Exception:
+                pass
+            self._unregister_active_browser(browser)
+        self._stop_thread_forwarder()
+        for attr in ('browser', 'tab'):
+            try:
+                delattr(self.thread_local, attr)
+            except Exception:
+                pass
 
     # ============================================================
     # 代理
     # ============================================================
     @classmethod
     def _parse_proxy_config(cls, pc):
-        """解析代理配置：单端口 or 端口池。返回 {type, host, ports, max_per}"""
+        """解析代理配置：single / 端口池 / pool。返回带 mode 的配置 dict。"""
         mode = pc.get('mode', 'single')
+        if mode == 'pool':
+            pool_type = pc.get('pool_type', 'socks5')
+            pool_file = (pc.get('pool_file') or 'proxypool.txt').strip()
+            # 相对路径 → 相对项目根目录（与 config.json 同级）
+            if not os.path.isabs(pool_file):
+                root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                pool_file = os.path.join(root, pool_file)
+            cls._proxy_pool = ProxyPool(pool_file, default_type=pool_type)
+            return {
+                'mode': 'pool',
+                'pool_type': pool_type,
+                'pool_file': pool_file,
+                'front_proxy': (pc.get('front_proxy') or '').strip(),
+            }
         proxy_type = pc.get('type', 'http')
         host = pc.get('host', '127.0.0.1')
         if mode == 'single':
             ports = [pc.get('single_port', 7890)]
         else:
             ports = list(range(pc.get('port_start', 24000), pc.get('port_end', 24064) + 1))
-        return {'type': proxy_type, 'host': host, 'ports': ports, 'max_per': pc.get('max_per_proxy', 20)}
+        return {'mode': mode, 'type': proxy_type, 'host': host, 'ports': ports,
+                'max_per': pc.get('max_per_proxy', 20)}
 
     def _pick_proxy(self):
-        """选择代理端口：两步——①过滤（排除用满的+烂IP）②加权随机（胜率高的优先）"""
+        """选择代理端口：two-step。pool 模式改走代理池（本地转发器链）。"""
         cfg = self._proxy_config
+        if cfg.get('mode') == 'pool':
+            return self._pick_proxy_pool(cfg)
         with self._state_lock:
             available = []
             for p in cfg['ports']:
@@ -444,6 +457,129 @@ class OutlookController:
         self.thread_local._proxy = proxy_url
         return proxy_url
 
+    def _pick_proxy_pool(self, cfg):
+        """pool 模式取一条可用代理：顺序取 → 起本地转发器 → 测完整链路连通性/出口IP → 好则用。
+
+        - 连不通 → mark_proxy_bad（此线本 run 内永久跳过）。
+        - 出口IP 命中坏IP集合 → 停转发器换下一条（不永久封线，动态住宅会轮换IP）。
+        - next_entry→None（全是死线）或试满上限仍无可用 → 判定池耗尽/暂不可用，返回 ''。
+        """
+        pool = type(self)._proxy_pool
+        if pool is None:
+            self.thread_local._pool_exhausted = True
+            return ''
+        if getattr(self.thread_local, '_pool_exhausted', False):
+            return ''
+        front = cfg.get('front_proxy', '')
+        max_attempts = max(pool.size() * 2, 8)
+        for _ in range(max_attempts):
+            entry = pool.next_entry()
+            if entry is None:
+                self.thread_local._pool_exhausted = True
+                self.log_event('PROXY', 'FAIL', 'pool',
+                               '代理池所有条目连通性均失败，判定【代理池已耗尽】')
+                return ''
+            try:
+                fwd = LocalForwarder(entry, front_proxy=front)
+            except Exception as exc:
+                pool.mark_proxy_bad(entry['raw'])
+                self.log_event('PROXY', 'WARN', 'pool',
+                               f"启动本地转发器失败，跳过 {entry['host']}:{entry['port']}: {exc}")
+                continue
+            test_url = f"socks5h://127.0.0.1:{fwd.port}"
+            info = self._get_ip_info(entry['raw'], requests_proxy_url=test_url,
+                                     timeout=15, use_cache=False)
+            exit_ip = info.get('ip')
+            if not exit_ip:
+                fwd.stop()
+                pool.mark_proxy_bad(entry['raw'])
+                self.log_event('PROXY', 'WARN', 'pool',
+                               f"连通性失败，记录并跳过 {entry['host']}:{entry['port']}"
+                               f"（{'经 7897 前置' if front else '直连'}）")
+                continue
+            if pool.is_ip_bad(exit_ip):
+                fwd.stop()
+                self.log_event('PROXY', 'INFO', 'pool',
+                               f"出口IP {exit_ip} 曾人机失败被标记，跳过换下一条")
+                continue
+            # 好代理：写 thread_local（_proxy 给 Chrome；_requests_proxy 给 requests，均走本地转发器链）
+            self._register_active_forwarder(fwd)
+            self.thread_local._proxy = fwd.local_url
+            self.thread_local._requests_proxy = test_url
+            self.thread_local._upstream = entry['requests_url']
+            self.thread_local._exit_ip = exit_ip
+            self.thread_local._ip_info = info
+            self.thread_local._proxy_key = entry['raw']
+            self.thread_local._forwarder = fwd
+            self.thread_local._pool_exhausted = False
+            self.log_event('PROXY', 'INFO', 'pool',
+                           f"顺序取 {entry['host']}:{entry['port']} → 本地端口 {fwd.port}"
+                           f"（{'经 7897 出墙' if front else '直连'}），出口IP={exit_ip} 国家={info.get('country')}")
+            return fwd.local_url
+        self.thread_local._pool_exhausted = True
+        self.log_event('PROXY', 'FAIL', 'pool',
+                       f"连续 {max_attempts} 次取代理均不可用（连不通或IP被标记），判定【代理池暂不可用】")
+        return ''
+
+    # ---- pool 模式辅助 ----
+    def _register_active_forwarder(self, fwd):
+        with self.cleanup_lock:
+            self.active_forwarders.append(fwd)
+
+    def _unregister_active_forwarder(self, fwd):
+        with self.cleanup_lock:
+            self.active_forwarders = [f for f in self.active_forwarders if f is not fwd]
+
+    def _stop_thread_forwarder(self):
+        fwd = getattr(self.thread_local, '_forwarder', None)
+        if fwd is not None:
+            try:
+                fwd.stop()
+            except Exception:
+                pass
+            self._unregister_active_forwarder(fwd)
+        for attr in ('_forwarder', '_upstream', '_exit_ip', '_proxy_key', '_requests_proxy'):
+            try:
+                delattr(self.thread_local, attr)
+            except Exception:
+                pass
+
+    def is_single_proxy_mode(self):
+        return (self._proxy_config or {}).get('mode') == 'single'
+
+    def is_pool_proxy_mode(self):
+        return (self._proxy_config or {}).get('mode') == 'pool'
+
+    def current_exit_ip(self):
+        info = getattr(self.thread_local, '_ip_info', None) or {}
+        return getattr(self.thread_local, '_exit_ip', None) or info.get('ip')
+
+    def current_requests_proxy(self):
+        return (getattr(self.thread_local, '_requests_proxy', None)
+                or getattr(self.thread_local, '_proxy', ''))
+
+    def record_bad_exit_ip(self, ip):
+        """记录坏出口IP（人机连续失败）：下次 pick 检测到同 IP 会跳过。
+
+        仅记 IP——动态住宅同一条线会轮换出不同 IP，故不永久封整条线。
+        """
+        pool = type(self)._proxy_pool
+        if pool is not None and ip:
+            pool.mark_ip_bad(ip)
+            self.log_event('PROXY', 'INFO', 'pool', f"记录坏出口IP {ip}，本 run 内后续检测到即跳过")
+
+    def pool_exhausted(self):
+        return bool(getattr(self.thread_local, '_pool_exhausted', False))
+
+    @classmethod
+    def release_proxy_pool(cls):
+        """整次运行结束：释放坏代理/坏IP 记录（不清空代理条目本身）。"""
+        if cls._proxy_pool is not None:
+            try:
+                cls._proxy_pool.release()
+            except Exception:
+                pass
+
     # ============================================================
     # 浏览器管理
     # ============================================================
@@ -458,8 +594,7 @@ class OutlookController:
         return tz
 
     def _make_fingerprint_seed(self, proxy_url):
-        """每个任务生成独立指纹种子（32-bit 正整数）。"""
-        # 混入代理端口 + 时间 + 随机，避免多任务共用同一设备指纹
+        """保留：为独立临时目录/日志生成一个种子（DP auto_port 自管数据目录）。"""
         port_part = 0
         try:
             hostport = proxy_url.split('//')[-1]
@@ -471,25 +606,9 @@ class OutlookController:
             seed = random.randint(1, 0x7FFFFFFF)
         return seed
 
-    def _prepare_user_data_dir(self, seed):
-        """为本次浏览器创建独立 user-data-dir。"""
-        base = self.browser_user_data_root
-        os.makedirs(base, exist_ok=True)
-        path = os.path.join(base, f"fp_{seed}_{os.getpid()}_{threading.get_ident()}")
-        os.makedirs(path, exist_ok=True)
-        return path
-
-    def _cleanup_user_data_dir(self, path):
-        if not path:
-            return
-        try:
-            shutil.rmtree(path, ignore_errors=True)
-        except Exception:
-            pass
-
     @staticmethod
     def clear_browser_profiles_dir(root, log_fn=None):
-        """清空 browser_profiles 目录下全部内容（保留目录本身）。"""
+        """清空 browser_profiles 目录下全部内容（保留目录本身）。DP 用临时目录，此处为兜底清理。"""
         if not root:
             return 0
         try:
@@ -522,230 +641,158 @@ class OutlookController:
         return removed
 
     def clear_browser_profiles_root(self, log=True):
-        """清空本实例配置的 fingerprint profile 根目录。"""
+        """清空本实例配置的 profile 根目录。"""
         root = getattr(self, 'browser_user_data_root', None)
         log_fn = self.log_plain if log and hasattr(self, 'log_plain') else None
         return self.clear_browser_profiles_dir(root, log_fn=log_fn)
 
     def launch_browser(self):
-        """启动浏览器：选代理 → fingerprint-chromium(可选) → 反检测参数。
-        返回 (playwright, browser_or_context)。
-        使用自定义 chrome.exe 时走 launch_persistent_context（独立 profile）。
+        """启动 DrissionPage 浏览器（本机真实 Chrome + 反检测）。
+
+        返回 (browser, tab)；失败返回 (None, None)。
+        每任务独立浏览器（新代理→新出口 IP）；auto_port 保证多线程安全。
         """
         try:
-            p = self._thread_playwright()
-            if not p:
-                return False, False
             proxy_url, info = self.prepare_thread_context()
+            if self.is_pool_proxy_mode() and (self.pool_exhausted() or not proxy_url):
+                self.log_event('BROWSER', 'FAIL', 'pool',
+                               '代理池无可用出口，跳过启动浏览器')
+                return None, None
             tz = self._resolve_timezone(info)
-            locale = 'zh-CN'
-            viewport = {
-                'width': random.choice([1366, 1440, 1536, 1680, 1920]),
-                'height': random.choice([768, 864, 900, 1050, 1080]),
-            }
-
-            args = [
-                '--lang=zh-CN',
-                '--accept-lang=zh-CN,zh,en-US,en',
-                '--disable-blink-features=AutomationControlled',
-                '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu',
-                '--disable-autofill-keyboard-accessory-view',
-                '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
-                '--disable-non-proxied-udp',
-                # 抑制 Windows Hello / Passkey / 安全密钥系统弹窗（网页层仍可能出「创建通行密钥」，靠后续取消/直达邮箱）
-                '--disable-webauthn',
-                '--disable-features=WebAuthentication,WebAuthenticationConditionalUI,WebAuthenticationCable,WebAuthenticationHybridTransport,WebAuthenticationPasskeysUI,Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider,AutofillServerCommunication,PasswordManagerOnboarding,PasswordImport,BiometricAuthenticationInSettings',
-                '--disable-save-password-bubble',
-                '--disable-password-manager-reauthentication',
-                '--disable-component-update',
-                '--disable-sync', '--disable-default-apps',
-                f'--timezone={tz}',
-            ]
-
-            common = {
-                'headless': self.headless,
-                'args': args,
-                'proxy': {"server": proxy_url, "bypass": "localhost"},
-            }
-
-            exe = self.browser_executable_path
-            profile_dir = None
-            seed = None
-            self.thread_local._persistent_context = False
-
-            if exe:
-                if not os.path.isfile(exe):
-                    self.log_event('BROWSER', 'FAIL', 'launch_detail', f"浏览器路径不存在: {exe}")
-                    return False, False
-                seed = self._make_fingerprint_seed(proxy_url) if self.fingerprint_enabled else random.randint(1, 0x7FFFFFFF)
-                profile_dir = self._prepare_user_data_dir(seed)
-                if self.fingerprint_enabled:
-                    args.append(f'--fingerprint={seed}')
-                    if self.fingerprint_platform:
-                        args.append(f'--fingerprint-platform={self.fingerprint_platform}')
-                    if self.fingerprint_brand:
-                        args.append(f'--fingerprint-brand={self.fingerprint_brand}')
-                mode = 'fingerprint-chromium' if self.fingerprint_enabled else 'custom-chromium'
-                self.log_event(
-                    'BROWSER', 'INFO', 'launch',
-                    f"exe={mode} path={exe} seed={seed} fp={self.fingerprint_enabled} tz={tz} proxy={proxy_url.split('//')[-1]}"
+            window_size = random.choice(self._window_sizes)
+            extra_args = ['--blink-settings=imagesEnabled=false'] if self.block_images else None
+            try:
+                browser, tab = D.build_browser(
+                    proxy_url=proxy_url,
+                    headless=self.headless,
+                    window_size=window_size,
+                    browser_path=self.browser_path,
+                    extra_args=extra_args,
                 )
-                # Playwright 要求 user_data_dir 走 persistent_context，不能塞进 args
-                ctx_opts = {
-                    **common,
-                    'executable_path': exe,
-                    'locale': locale,
-                    'timezone_id': tz,
-                    'viewport': viewport,
-                }
-                if info.get('loc'):
-                    try:
-                        lat, lng = info['loc'].split(',')
-                        ctx_opts['geolocation'] = {'latitude': float(lat), 'longitude': float(lng)}
-                    except Exception:
-                        pass
-                b = p.chromium.launch_persistent_context(profile_dir, **ctx_opts)
-                self.thread_local._persistent_context = True
-            else:
-                # executable_path 为空：使用 patchright 自带 Chromium（A/B：对照指纹浏览器）
-                self.log_event(
-                    'BROWSER', 'INFO', 'launch',
-                    f"exe=patchright-chromium fp=false tz={tz} proxy={proxy_url.split('//')[-1]}"
-                )
-                b = p.chromium.launch(**common)
+            except Exception as exc:
+                self._log_browser_failure('launch', exc)
+                self.log_event('BROWSER', 'FAIL', 'launch_detail', f"启动浏览器失败: {exc}")
+                return None, None
 
-            self.thread_local._browser_profile_dir = profile_dir
-            self.thread_local._fingerprint_seed = seed
-            self._register_active_browser(b)
-            return p, b
+            self.log_event(
+                'BROWSER', 'INFO', 'launch',
+                f"exe=system-chrome stealth=screenX+force tz={tz} "
+                f"win={window_size[0]}x{window_size[1]} proxy={proxy_url.split('//')[-1]}"
+            )
+            # 反检测准备：screenX 补丁 + 时区/语言/地理 CDP 覆盖 + eager 加载
+            try:
+                D.prepare_tab(tab, timezone=tz, locale='zh-CN', loc=info.get('loc'))
+            except Exception as exc:
+                self.log_event('BROWSER', 'WARN', 'prepare', f"tab 反检测准备异常: {exc}")
+
+            # 挂后台：有头且开启 background 时最小化窗口，不抢前台焦点（反节流开关保证仍全速）
+            if self.background_window and not self.headless:
+                try:
+                    D.minimize_window(tab)
+                except Exception:
+                    pass
+
+            self._register_active_browser(browser)
+            return browser, tab
         except Exception as e:
-            profile_dir = getattr(self.thread_local, '_browser_profile_dir', None)
-            self._cleanup_user_data_dir(profile_dir)
-            if hasattr(self.thread_local, '_browser_profile_dir'):
-                delattr(self.thread_local, '_browser_profile_dir')
-            failure_key = self._log_browser_failure('launch', e)
+            self._log_browser_failure('launch', e)
             self.log_event('BROWSER', 'FAIL', 'launch_detail', f"启动浏览器失败: {e}")
-            if failure_key == 'playwright_runtime_fail':
-                self._dispose_thread_browser()
-                self._dispose_thread_playwright()
-            return False, False
+            return None, None
 
     def get_thread_browser(self):
         """获取当前线程的浏览器。首次调用时创建，之后复用。线程隔离，各自独立。"""
         if not hasattr(self.thread_local, "browser"):
-            p, b = self.launch_browser()
-            if not p:
-                return False
-            self.thread_local.browser = b
+            browser, tab = self.launch_browser()
+            if not browser:
+                return None
+            self.thread_local.browser = browser
+            self.thread_local.tab = tab
         return self.thread_local.browser
 
     def get_thread_page(self):
+        """返回当前线程可用的工作 tab（DrissionPage ChromiumTab）。"""
         browser = self.get_thread_browser()
         if not browser:
             return None
-
-        # fingerprint-chromium 使用 persistent context：browser 实际是 BrowserContext
-        if getattr(self.thread_local, '_persistent_context', False):
+        tab = getattr(self.thread_local, 'tab', None)
+        if tab is None:
             try:
-                pages = list(browser.pages)
-                # 优先复用已有标签页（自定义 Chromium 有时禁止 Target.createTarget）
-                if pages:
-                    page = pages[0]
-                    for extra in pages[1:]:
-                        try:
-                            extra.close()
-                        except Exception:
-                            pass
-                    try:
-                        page.goto('about:blank', timeout=10000)
-                    except Exception:
-                        pass
-                    return page
-                return browser.new_page()
+                tab = browser.latest_tab
+                _, info = self.prepare_thread_context()
+                D.prepare_tab(tab, timezone=self._resolve_timezone(info),
+                              locale='zh-CN', loc=info.get('loc'))
+                self.thread_local.tab = tab
             except Exception as exc:
                 self._log_browser_failure('page', exc)
                 self._dispose_thread_browser()
                 return None
+        return tab
 
-        _, info = self.prepare_thread_context()
-        locale = 'zh-CN'  # 强制中文（元素定位依赖中文 text）
-        tz = self._resolve_timezone(info)
-        viewport = {'width': random.choice([1366, 1440, 1536, 1680, 1920]),
-                    'height': random.choice([768, 864, 900, 1050, 1080])}
-        context_opts = {
-            'locale': locale,
-            'timezone_id': tz,
-            'viewport': viewport,
-        }
-        if info.get('loc'):
-            try:
-                lat, lng = info['loc'].split(',')
-                context_opts['geolocation'] = {'latitude': float(lat), 'longitude': float(lng)}
-            except Exception:
-                pass
-        context = None
-        try:
-            context = browser.new_context(**context_opts)
-        except Exception as exc:
-            failure_key = self._log_browser_failure('context', exc)
-            self._dispose_thread_browser()
-            if failure_key == 'playwright_runtime_fail':
-                self._dispose_thread_playwright()
+    def new_context_tab(self, timezone=None, loc=None):
+        """在当前线程浏览器里开一个新 tab（同 context，cookie 共享），已完成反检测准备。"""
+        browser = self.get_thread_browser()
+        if not browser:
             return None
         try:
-            return context.new_page()
+            tab = browser.new_tab()
         except Exception as exc:
             self._log_browser_failure('page', exc)
-            try:
-                context.close()
-            except Exception:
-                pass
-            self._dispose_thread_browser()
             return None
+        if timezone is None:
+            _, info = self.prepare_thread_context()
+            timezone = self._resolve_timezone(info)
+            loc = info.get('loc')
+        D.prepare_tab(tab, timezone=timezone, locale='zh-CN', loc=loc)
+        return tab
+
+    def export_cookies(self, tab):
+        """导出全部 cookie（替代 Playwright storage_state）。返回 list[dict]。"""
+        try:
+            return list(tab.cookies(all_domains=True, all_info=True))
+        except Exception:
+            return []
+
+    def inject_cookies(self, tab, cookies):
+        """把导出的 cookie 注入新 tab（先落到登录域再设置）。"""
+        if not cookies:
+            return False
+        try:
+            tab.set.cookies(cookies)
+            return True
+        except Exception:
+            return False
 
     def clean_up(self, page=None, type="all_browser"):
         """
         资源清理。
-        - done_browser: 关闭当前线程的浏览器和page（OAuth2重试前调用，确保下次拿新IP）
+        - done_browser: 关闭当前线程的浏览器（OAuth2重试前调用，确保下次拿新IP）
         - all_browser: 关闭所有活跃浏览器（程序结束时调用）
         """
         if type == "done_browser":
-            if page:
-                try:
-                    page.context.close()
-                except Exception:
-                    pass
-            profile_dir = getattr(self.thread_local, '_browser_profile_dir', None)
             self._dispose_thread_browser()
-            self._cleanup_user_data_dir(profile_dir)
-            if hasattr(self.thread_local, '_browser_profile_dir'):
-                delattr(self.thread_local, '_browser_profile_dir')
-            if hasattr(self.thread_local, '_fingerprint_seed'):
-                delattr(self.thread_local, '_fingerprint_seed')
             self._reset_thread_runtime()
         elif type == "all_browser":
-            profile_dir = getattr(self.thread_local, '_browser_profile_dir', None)
             with self.cleanup_lock:
                 browsers = list(self.active_resources)
-                playwights = list(self.active_playwrights)
                 self.active_resources.clear()
-                self.active_playwrights.clear()
+                forwarders = list(self.active_forwarders)
+                self.active_forwarders.clear()
             for browser in browsers:
                 try:
-                    browser.close()
+                    browser.quit(timeout=5, force=True, del_data=True)
                 except Exception:
                     pass
-            for playwright in playwights:
+            for fwd in forwarders:
                 try:
-                    playwright.stop()
+                    fwd.stop()
                 except Exception:
                     pass
-            self._cleanup_user_data_dir(profile_dir)
-            if hasattr(self.thread_local, '_browser_profile_dir'):
-                delattr(self.thread_local, '_browser_profile_dir')
-            if hasattr(self.thread_local, '_fingerprint_seed'):
-                delattr(self.thread_local, '_fingerprint_seed')
-            # 关掉浏览器后再清空整个 profiles 根目录（正常/异常收尾都走这里）
+            for attr in ('browser', 'tab'):
+                try:
+                    delattr(self.thread_local, attr)
+                except Exception:
+                    pass
+            # 兜底清空 profiles 根目录（DP 临时目录已随 quit(del_data) 删除）
             try:
                 self.clear_browser_profiles_root(log=True)
             except Exception:
@@ -763,6 +810,14 @@ class OutlookController:
         
         返回: True(注册成功) 或 False(失败)
         """
+        # 记录本次失败落在哪一阶段，供上层区分「人机验证失败」与「IP打不开/表单失败」
+        # （只有人机失败才整体重试、并在耗尽后判定此IP不可用）
+        try:
+            self.thread_local._last_fail_stage = None
+            self.thread_local._current_email_local = str(email or '').strip()
+            self.thread_local._current_email_full = f"{email}{self.email_suffix}"
+        except Exception:
+            pass
         fake = Faker()
         lastname = fake.last_name()
         firstname = fake.first_name()
@@ -771,86 +826,95 @@ class OutlookController:
         day = str(random.randint(1, 25))
 
         try:
-            page.goto("https://outlook.live.com/mail/0/?prompt=create_account", timeout=30000, wait_until="domcontentloaded")
-            page.get_by_text('同意并继续').wait_for(timeout=30000)
+            page.get('https://outlook.live.com/mail/0/?prompt=create_account')
+            if not D.q(page, 'text:同意并继续', timeout=30):
+                raise TimeoutError('agree button not found')
             start_time = time.time()
-            page.wait_for_timeout(0.1 * self.wait_time)
-            page.get_by_text('同意并继续').click(timeout=30000)
+            page.wait(0.1 * self.wait_time / 1000)
+            D.click_sel(page, 'text:同意并继续', timeout=30)
         except Exception:
             self.bump_failure('ip_cant_open', 'register_page_open_fail')
             self._log("[Fail:IP] - IP质量不佳，无法打开Outlook注册页面，请换IP重试")
             return False
 
         try:
+            D.disable_autofill(page)
             # 选择是 outlook还是hotmail
             if self.email_suffix == "@hotmail.com":
-                page.get_by_text("@outlook.com").click(timeout=10000)
-                page.locator(f'[role="option"]:text-is("@hotmail.com")').click()
+                D.click_sel(page, 'text:@outlook.com', timeout=10)
+                opt = D.q(page, 'xpath://*[@role="option" and normalize-space(.)="@hotmail.com"]', timeout=5)
+                if opt:
+                    opt.click()
 
             # 填充邮箱
-            email_input = page.locator('[aria-label="新建电子邮件"]')
+            email_input = page.ele('css:[aria-label="新建电子邮件"]', timeout=10)
             email_input.click()
-            email_input.fill(email, timeout=10000)
+            email_input.input(email, clear=True)
 
             # 点击 "下一步
-            page.locator('[data-testid="primaryButton"]').click(timeout=5000)
-            page.wait_for_timeout(0.02 * self.wait_time)
+            D.click_sel(page, '[data-testid="primaryButton"]', timeout=5)
+            page.wait(0.02 * self.wait_time / 1000)
 
-            #填充密码
-            page.locator('[type="password"]').type(password, delay=0.004 * self.wait_time, timeout=10000)
-            page.wait_for_timeout(0.02 * self.wait_time)
-            
+            # 填充密码（真实输入）
+            pwd_input = page.ele('css:[type="password"]', timeout=10)
+            pwd_input.input(password, clear=True)
+            page.wait(0.02 * self.wait_time / 1000)
+
             # 点击 "下一步
-            page.locator('[data-testid="primaryButton"]').click(timeout=5000)
-            page.wait_for_timeout(0.03 * self.wait_time)
+            D.click_sel(page, '[data-testid="primaryButton"]', timeout=5)
+            page.wait(0.03 * self.wait_time / 1000)
 
             # 填充出生的年份
-            page.locator('[name="BirthYear"]').fill(year, timeout=10000)
+            D.fill_sel(page, '[name="BirthYear"]', year, timeout=10)
 
             # 填充出生日期,实际上不会走 try，走的是Except。因为 有浮层的存在，
             try:
                 # 填充月份
-                page.wait_for_timeout(0.02 * self.wait_time)
-                page.locator('[name="BirthMonth"]').select_option(value=month, timeout=1000)
+                page.wait(0.02 * self.wait_time / 1000)
+                page.ele('css:[name="BirthMonth"]', timeout=1).select.by_value(month)
 
                 # 填充日期
-                page.wait_for_timeout(0.05 * self.wait_time)
-                page.locator('[name="BirthDay"]').select_option(value=day)
+                page.wait(0.05 * self.wait_time / 1000)
+                page.ele('css:[name="BirthDay"]', timeout=1).select.by_value(day)
             except Exception:
 
                 # 填充月份
-                page.locator('[name="BirthMonth"]').click()
-                page.wait_for_timeout(0.02 * self.wait_time)
-                page.locator(f'[role="option"]:text-is("{month}月")').click()
-                page.wait_for_timeout(0.04 * self.wait_time)
+                D.click_sel(page, '[name="BirthMonth"]', timeout=5)
+                page.wait(0.02 * self.wait_time / 1000)
+                mo = D.q(page, f'xpath://*[@role="option" and normalize-space(.)="{month}月"]', timeout=5)
+                if mo:
+                    mo.click()
+                page.wait(0.04 * self.wait_time / 1000)
 
                 # 填充日期
-                page.locator('[name="BirthDay"]').click()
-                page.wait_for_timeout(0.03 * self.wait_time)
-                page.locator(f'[role="option"]:text-is("{day}日")').click()
-                page.locator('[data-testid="primaryButton"]').click(timeout=5000)
+                D.click_sel(page, '[name="BirthDay"]', timeout=5)
+                page.wait(0.03 * self.wait_time / 1000)
+                da = D.q(page, f'xpath://*[@role="option" and normalize-space(.)="{day}日"]', timeout=5)
+                if da:
+                    da.click()
+                D.click_sel(page, '[data-testid="primaryButton"]', timeout=5)
 
             # 填充姓氏
-            page.locator('#lastNameInput').type(lastname, delay=0.002 * self.wait_time, timeout=10000)
-            page.wait_for_timeout(0.02 * self.wait_time)
+            D.fill_sel(page, '#lastNameInput', lastname, timeout=10)
+            page.wait(0.02 * self.wait_time / 1000)
 
             # 填充名字
-            page.locator('#firstNameInput').fill(firstname, timeout=10000)
+            D.fill_sel(page, '#firstNameInput', firstname, timeout=10)
 
             if time.time() - start_time < self.wait_time / 1000:
-                page.wait_for_timeout(self.wait_time - (time.time() - start_time) * 1000)
+                page.wait((self.wait_time - (time.time() - start_time) * 1000) / 1000)
 
             # 点击 "下一步
-            page.locator('[data-testid="primaryButton"]').click(timeout=5000)
-            page.locator('span > [href="https://go.microsoft.com/fwlink/?LinkID=521839"]').wait_for(state='detached', timeout=22000)
-            page.wait_for_timeout(400)
+            D.click_sel(page, '[data-testid="primaryButton"]', timeout=5)
+            D.wait_gone(page, 'span > [href="https://go.microsoft.com/fwlink/?LinkID=521839"]', timeout=22)
+            page.wait(0.4)
 
-            if page.get_by_text('一些异常活动').count() or page.get_by_text('此站点正在维护，暂时无法使用，请稍后重试。').count() > 0:
+            if D.count(page, 'text:一些异常活动') or D.count(page, 'text:此站点正在维护，暂时无法使用，请稍后重试。') > 0:
                 self.bump_failure('ip_blocked')
                 self._log("[Fail:IP] - 当前IP已被微软风控拦截，请更换IP重试")
                 return False
 
-            if page.locator('iframe#enforcementFrame').count() > 0:
+            if D.count(page, 'iframe#enforcementFrame') > 0:
                 self.bump_failure('funcaptcha')
                 self._log("[Fail:Captcha] - 验证码类型为FunCaptcha而非按压验证码，当前IP暂不支持，请换IP重试")
                 return False
@@ -863,6 +927,10 @@ class OutlookController:
             captcha_result = self.handle_captcha(page)
             # 没有通过，报错
             if not captcha_result:
+                try:
+                    self.thread_local._last_fail_stage = 'captcha'
+                except Exception:
+                    pass
                 raise TimeoutError
 
             # 验证码通过后：跳过辅助邮箱 / 通行密钥拦截，进入邮箱
@@ -887,23 +955,36 @@ class OutlookController:
 
         # 邮箱初始化 + cookie/SSO 沉淀：进 OAuth 前固定多等几秒
         # 证据：过早跳 authorize 常落到 #i0116；重开浏览器更糟
-        oauth_settle_ms = 7000
+        # 注：新号邮箱首页常卡在「未初始化」很久（微软后台 provisioning 慢），
+        #     原先死等 [aria-label="新邮件"] 就绪信号会白白阻塞。现改为固定等 30s
+        #     直接进 OAuth（cookie/SSO 此时已沉淀，不依赖邮箱首页渲染完成）。
+        mail_settle_ms = 30000
+        self.log_event('REGISTER', 'INFO', 'mail_init',
+                       f'跳过邮箱就绪探测，固定等待 {mail_settle_ms}ms 沉淀 cookie 后进 OAuth2')
         try:
-            page.locator('[aria-label="新邮件"]').wait_for(timeout=32000)
-            self.log_event('REGISTER', 'INFO', 'mail_init', f'收件箱就绪，等待 {oauth_settle_ms}ms 沉淀 cookie')
-            page.wait_for_timeout(oauth_settle_ms)
-            return True
+            page.wait(mail_settle_ms / 1000)
         except Exception:
-            self.bump_failure('mail_init_fail')
-            self.log_event(
-                'REGISTER', 'WARN', 'mail_init',
-                f'邮箱未初始化，仍等待 {oauth_settle_ms}ms 后继续 OAuth2',
-            )
-            try:
-                page.wait_for_timeout(oauth_settle_ms)
-            except Exception:
-                pass
-            return True
+            pass
+        return True
+        # --- 旧逻辑：死等邮箱就绪信号（新号常卡未初始化，已停用）---
+        # oauth_settle_ms = 7000
+        # try:
+        #     if not D.q(page, '[aria-label="新邮件"]', timeout=32):
+        #         raise TimeoutError('mailbox not ready')
+        #     self.log_event('REGISTER', 'INFO', 'mail_init', f'收件箱就绪，等待 {oauth_settle_ms}ms 沉淀 cookie')
+        #     page.wait(oauth_settle_ms / 1000)
+        #     return True
+        # except Exception:
+        #     self.bump_failure('mail_init_fail')
+        #     self.log_event(
+        #         'REGISTER', 'WARN', 'mail_init',
+        #         f'邮箱未初始化，仍等待 {oauth_settle_ms}ms 后继续 OAuth2',
+        #     )
+        #     try:
+        #         page.wait(oauth_settle_ms / 1000)
+        #     except Exception:
+        #         pass
+        #     return True
 
     def _is_mailbox_url(self, page):
         try:
@@ -917,17 +998,9 @@ class OutlookController:
             return False
         return True
 
-    def _click_if_visible(self, locator, timeout_ms=2500):
-        try:
-            target = locator.first
-            if target.count() <= 0:
-                return False
-            if not target.is_visible():
-                return False
-            target.click(timeout=timeout_ms)
-            return True
-        except Exception:
-            return False
+    def _click_if_visible(self, page, sel, timeout_ms=2500):
+        """可见则点击（sel 为 CSS/DP 选择器字符串）。"""
+        return D.click_if_visible(page, sel, timeout=timeout_ms / 1000)
 
     def _try_bind_recovery_email(self, page):
         """保护帐户页：创建临时邮箱 → 填 #EmailAddress → 接码 → #iOttText。失败则调用方再 skip。"""
@@ -944,7 +1017,16 @@ class OutlookController:
         def _log(stage, message, level='INFO'):
             self.log_event('REGISTER', level, stage, message)
 
-        result = bind_recovery_email(page, self.temp_mail_cfg, log=_log)
+        cfg = dict(self.temp_mail_cfg or {})
+        self_cfg = dict((cfg.get('self') or {}))
+        local = str(getattr(self.thread_local, '_current_email_local', '') or '').strip()
+        if local:
+            cfg['name_prefix'] = local
+            cfg['enable_prefix'] = True
+            self_cfg['name_prefix'] = local
+            cfg['self'] = self_cfg
+
+        result = bind_recovery_email(page, cfg, log=_log, local_name=(local or None))
         # 兼容 (ok, session) 或旧版 bool
         if isinstance(result, tuple):
             ok, session = result[0], (result[1] if len(result) > 1 else None)
@@ -989,7 +1071,7 @@ class OutlookController:
             from controllers.recovery_bind import is_protect_account_page, is_ott_code_page
             on_protect = is_protect_account_page(page) or is_ott_code_page(page)
         except Exception:
-            on_protect = page.locator('#EmailAddress').count() > 0 or page.locator('#iOttText').count() > 0
+            on_protect = D.count(page, '#EmailAddress') > 0 or D.count(page, '#iOttText') > 0
 
         if on_protect and self.bind_recovery_email:
             if self._try_bind_recovery_email(page):
@@ -999,35 +1081,25 @@ class OutlookController:
                 )
                 acted = True
             else:
-                if self._click_if_visible(page.locator('#iShowSkip')):
+                if self._click_if_visible(page, '#iShowSkip'):
                     self._mark_recovery_skipped()
                     self.log_event(
                         'REGISTER', 'WARN', 'skip_recovery',
                         '注册阶段绑定失败，已 #iShowSkip；OAuth 仍可能再要求绑定',
                     )
                     acted = True
-        elif on_protect or page.locator('#iShowSkip').count() > 0:
+        elif on_protect or D.count(page, '#iShowSkip') > 0:
             # temp_mail.enabled=false 时：只跳过
-            if self._click_if_visible(page.locator('#iShowSkip')):
+            if self._click_if_visible(page, '#iShowSkip'):
                 self._mark_recovery_skipped()
                 self.log_event('REGISTER', 'INFO', 'skip_recovery', '已点击 #iShowSkip 暂时跳过辅助邮箱')
                 acted = True
             else:
                 for text in ('暂时跳过', 'Skip for now', 'Skip'):
                     try:
-                        loc = page.get_by_role('link', name=text)
-                        if self._click_if_visible(loc):
+                        if D.click_role_button(page, text) or D.click_if_visible(page, f'text:{text}'):
                             self._mark_recovery_skipped()
-                            self.log_event('REGISTER', 'INFO', 'skip_recovery', f'已点击跳过链接: {text}')
-                            acted = True
-                            break
-                    except Exception:
-                        pass
-                    try:
-                        loc = page.get_by_text(text, exact=False)
-                        if self._click_if_visible(loc):
-                            self._mark_recovery_skipped()
-                            self.log_event('REGISTER', 'INFO', 'skip_recovery', f'已点击跳过文案: {text}')
+                            self.log_event('REGISTER', 'INFO', 'skip_recovery', f'已点击跳过: {text}')
                             acted = True
                             break
                     except Exception:
@@ -1036,7 +1108,7 @@ class OutlookController:
         # 2) Windows 通行密钥 / Hello：优先点「取消」#idBtn_Back
         passkey_hint = False
         try:
-            body = (page.locator('body').inner_text(timeout=800) or '')[:1200]
+            body = D.body_text(page, limit=1200)
             passkey_hint = any(
                 k in body
                 for k in (
@@ -1048,18 +1120,18 @@ class OutlookController:
         except Exception:
             pass
 
-        back = page.locator('#idBtn_Back')
         try:
-            if back.count() > 0 and back.first.is_visible():
+            back = D.q(page, '#idBtn_Back')
+            if back and back.states.is_displayed:
                 value = ''
                 try:
-                    value = ((back.first.get_attribute('value') or '') + ' ' + (back.first.inner_text() or '')).strip()
+                    value = ((back.attr('value') or '') + ' ' + (back.text or '')).strip()
                 except Exception:
                     value = ''
                 is_cancel = any(k in value for k in ('取消', 'Cancel', 'No', 'not now', 'Not now', '暂时不要'))
                 # 仅在确认是通行密钥/Hello 页时点取消；避免保护帐户流程里误点「取消」
                 if passkey_hint and is_cancel:
-                    if self._click_if_visible(back):
+                    if self._click_if_visible(page, '#idBtn_Back'):
                         self.log_event(
                             'REGISTER', 'INFO', 'skip_passkey',
                             f'已点击 #idBtn_Back value={value[:40]!r} passkey_hint={passkey_hint}',
@@ -1072,14 +1144,14 @@ class OutlookController:
         if passkey_hint:
             for text in ('取消', 'Cancel', '暂时不要', 'Not now', 'Skip for now'):
                 try:
-                    if self._click_if_visible(page.get_by_role('button', name=text)):
+                    if D.click_role_button(page, text):
                         self.log_event('REGISTER', 'INFO', 'skip_passkey', f'已点击按钮: {text}')
                         acted = True
                         break
                 except Exception:
                     pass
                 try:
-                    if self._click_if_visible(page.locator(f'input[type="button"][value="{text}"]')):
+                    if self._click_if_visible(page, f'input[type="button"][value="{text}"]'):
                         self.log_event('REGISTER', 'INFO', 'skip_passkey', f'已点击 input: {text}')
                         acted = True
                         break
@@ -1105,7 +1177,7 @@ class OutlookController:
         saw_protect = False
 
         try:
-            page.wait_for_timeout(1200)
+            page.wait(1.2)
         except Exception:
             pass
 
@@ -1115,9 +1187,9 @@ class OutlookController:
                 on_protect = is_protect_account_page(page) or is_ott_code_page(page)
             except Exception:
                 on_protect = (
-                    page.locator('#EmailAddress').count() > 0
-                    or page.locator('#iOttText').count() > 0
-                    or page.locator('#iShowSkip').count() > 0
+                    D.count(page, '#EmailAddress') > 0
+                    or D.count(page, '#iOttText') > 0
+                    or D.count(page, '#iShowSkip') > 0
                 )
             if on_protect:
                 if not saw_protect:
@@ -1128,11 +1200,11 @@ class OutlookController:
                 saw_protect = True
 
             if self._dismiss_post_register_intercepts(page):
-                page.wait_for_timeout(800)
+                page.wait(0.8)
                 continue
 
             if self._is_mailbox_url(page) and not on_protect:
-                if page.locator('#iShowSkip').count() == 0 and page.locator('#EmailAddress').count() == 0:
+                if D.count(page, '#iShowSkip') == 0 and D.count(page, '#EmailAddress') == 0:
                     st = self.recovery_bind_status()
                     self.log_event(
                         'REGISTER', 'OK', 'mail_enter',
@@ -1143,7 +1215,7 @@ class OutlookController:
 
             # 短探针窗口：仅多等几秒看是否弹出保护页
             if self.bind_recovery_email and not saw_protect and time.time() < protect_probe_deadline:
-                page.wait_for_timeout(400)
+                page.wait(0.4)
                 continue
 
             if force_count < 2:
@@ -1153,13 +1225,13 @@ class OutlookController:
                         'REGISTER', 'INFO', 'mail_goto',
                         f'跳转邮箱({force_count}) saw_protect={saw_protect} {mail_url}',
                     )
-                    page.goto(mail_url, timeout=25000, wait_until='domcontentloaded')
-                    page.wait_for_timeout(1200)
+                    page.get(mail_url)
+                    page.wait(1.2)
                     self._dismiss_post_register_intercepts(page)
-                    page.wait_for_timeout(600)
+                    page.wait(0.6)
                     if self._is_mailbox_url(page):
                         if not self._dismiss_post_register_intercepts(page):
-                            if page.locator('#EmailAddress').count() == 0 and page.locator('#iShowSkip').count() == 0:
+                            if D.count(page, '#EmailAddress') == 0 and D.count(page, '#iShowSkip') == 0:
                                 st = self.recovery_bind_status()
                                 self.log_event(
                                     'REGISTER', 'OK', 'mail_enter',
@@ -1168,12 +1240,12 @@ class OutlookController:
                                 return True
                 except Exception as exc:
                     self.log_event('REGISTER', 'WARN', 'mail_goto', f'跳转邮箱失败: {exc}')
-                    page.wait_for_timeout(800)
+                    page.wait(0.8)
             else:
-                page.wait_for_timeout(500)
+                page.wait(0.5)
 
         try:
-            page.goto(mail_url, timeout=20000, wait_until='domcontentloaded')
+            page.get(mail_url)
             self._dismiss_post_register_intercepts(page)
         except Exception:
             pass
@@ -1200,14 +1272,28 @@ class OutlookController:
             return self._captcha_manual(page)
         return self._captcha_hold(page)
 
+    def _hand_off_at_captcha(self, page, email, password):
+        """策略 2：填表已到验证码界面，验证码 + 进邮箱 + OAuth 全部交人工。"""
+        self.log_event(
+            'REGISTER', 'WARN', 'handoff',
+            f'已到验证码界面，交由人工完成：{email}{self.email_suffix} / {password}',
+        )
+        return 'handed_off'
+
     def _captcha_manual(self, page):
-        """半自动模式：程序暂停，轮询检测是否进入邮箱（最多5分钟），你手动按压验证码"""
-        self.log_event('CAPTCHA', 'WARN', 'manual', '请手动完成验证码按压，等待进入邮箱...')
+        """半自动模式：脚本暂停，你只需在浏览器窗口里手动过「人机验证」本身。
+        验证码之后可能弹出的「保护你的帐户/绑定辅助邮箱」「设置通行密钥」等页面，
+        由脚本复用全自动流程自动处理（你不用点），直到进入邮箱为止（最多 5 分钟）；
+        之后拿 OAuth token 等「后面的活」照常全自动。"""
+        self.log_event('CAPTCHA', 'WARN', 'manual',
+                       '请在浏览器窗口手动完成人机验证；验证码之后的保护帐户/通行密钥等页面脚本会自动处理...')
         for _ in range(300):
-            page.wait_for_timeout(1000)
+            page.wait(1.0)
             try:
-                if 'outlook.live.com/mail/0/' in page.url:
-                    page.wait_for_timeout(2000)
+                # 你过完人机后可能先弹保护帐户/绑辅助邮箱/通行密钥——复用自动流程处理，你不用管
+                self._dismiss_post_register_intercepts(page)
+                if self._is_mailbox_url(page):
+                    page.wait(2.0)
                     self.log_event('CAPTCHA', 'OK', 'manual', '已进入邮箱！')
                     return True
             except Exception:
@@ -1219,22 +1305,40 @@ class OutlookController:
     # 全自动按压验证码
     # ============================================================
     def _captcha_hold(self, page):
-        """全自动按压主循环：找目标 → 移动 → 按压 → 微颤 → 点按钮2 → 检查结果"""
-        if not self._wait_for_captcha_frame(page):
+        """验证码分派：先定位挑战 iframe，再按类型解题。
+
+        - PerimeterX「按住」(hsprotect / #px-captcha)：单次长按不放 + 微颤，等 checkmark / 挑战消失。
+        - Arkose「点击」(circle / svg / 可访问性挑战)：点目标 → 等『再次按下』→ 点击。
+        所有鼠标事件走 dp_page 原始 CDP，带 force(pressure)≈0.5，screenX/screenY 已被 STEALTH_JS 补丁修正。
+        """
+        frames = self._wait_for_captcha_frame(page)
+        if not frames:
             self.bump_failure('captcha_btn2_never_appeared')
             self.penalize_ip(penalty=4)
             self._log("未检测到验证码iframe")
             return False
 
-        # 微软验证码是嵌套iframe结构
-        frame1 = page.frame_locator('iframe[title="验证质询"]')
-        frame2 = frame1.frame_locator('iframe[style*="display: block"]')
+        frame1, frame2 = frames
+        if self._is_px_challenge(page, frame1):
+            if self.px_solve_mode == 'a11y':
+                return self._solve_px_a11y(page, frame1)
+            return self._solve_px_hold(page, frame1)
+        return self._solve_arkose(page, frame1, frame2)
+
+    def _solve_arkose(self, page, frame1, frame2):
+        """Arkose 点击式挑战（旧版微软验证码）：点目标 → 等按钮2 → 点击 → 检查结果。"""
         self._human_prelude(page)
         btn2_seen = False
 
-        for attempt in range(self.max_captcha_retries + 1):
-            self._log(f"Hold {attempt+1}/{self.max_captcha_retries+1}")
-            page.wait_for_timeout(random.randint(200, 600))
+        _tries = max(1, self.max_captcha_retries)
+        for attempt in range(_tries):
+            self._log(f"Hold {attempt+1}/{_tries}")
+            page.wait(random.randint(200, 600) / 1000)
+
+            # 每轮重新解析 frame，防止刷新后句柄失效
+            frame1, frame2 = self._resolve_captcha_frames(page) or (frame1, frame2)
+            if not frame2:
+                continue
 
             # ① 在iframe中找到可点击的目标元素
             box, target_label = self._find_target(frame2, attempt)
@@ -1246,23 +1350,23 @@ class OutlookController:
             pos_name, x, y = self._pick_position(box, cx, cy)
             self._log(f"target={target_label} pos={pos_name}")
 
-            # ③ 从远处Bezier曲线移动到目标按钮
+            # ③ 从远处Bezier曲线移动到目标按钮（未按下，buttons=0）
             from_x, from_y = x + random.uniform(-250, 250), y + random.uniform(-250, 250)
-            page.mouse.move(from_x, from_y, steps=1)
-            page.wait_for_timeout(random.randint(40, 150))
+            D.mouse_move(page, from_x, from_y, buttons=0)
+            page.wait(random.randint(40, 150) / 1000)
             self._natural_move(page, from_x, from_y, x, y)
 
-            # ④ C:double-tap — 双击→松开→长按
-            page.mouse.down(); page.wait_for_timeout(random.randint(25, 55))
-            page.mouse.up();   page.wait_for_timeout(random.randint(80, 220))
-            page.mouse.down(); page.wait_for_timeout(random.randint(25, 55))
-            page.mouse.up();   page.wait_for_timeout(random.randint(120, 380))
-            page.mouse.down()
+            # ④ C:double-tap — 双击→松开→长按（带 force）
+            D.mouse_press(page, x, y); page.wait(random.randint(25, 55) / 1000)
+            D.mouse_release(page, x, y); page.wait(random.randint(80, 220) / 1000)
+            D.mouse_press(page, x, y); page.wait(random.randint(25, 55) / 1000)
+            D.mouse_release(page, x, y); page.wait(random.randint(120, 380) / 1000)
+            D.mouse_press(page, x, y)
 
             # ⑤ 按住并圆形微颤，等按钮2出现
             appeared = self._hold_and_wait(page, frame2, x, y)
             if not appeared:
-                page.mouse.up()
+                D.mouse_release(page, x, y)
                 continue
             btn2_seen = True
 
@@ -1295,6 +1399,674 @@ class OutlookController:
         self._record_ip('loss')
         self._print_stats()
         return False
+
+    # ============================================================
+    # PerimeterX「按住」验证码（hsprotect.net / #px-captcha）
+    # ============================================================
+    def _is_px_challenge(self, page, frame1):
+        """判定当前是否 PerimeterX 按住挑战：frame1 内有 #px-captcha 或 url 属 hsprotect/px。"""
+        try:
+            if frame1 and D.q(frame1, '#px-captcha', timeout=0):
+                return True
+            u = (getattr(frame1, 'url', '') or '')
+            if any(k in u for k in ('hsprotect', 'px-captcha', 'perimeterx', 'px-cdn')):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _px_press_box(self, page, frame1):
+        """真实视口按压盒子（自算 OOPIF 偏移）。返回 {'cx','cy','w','h'} 或 None。
+
+        关键坑：验证质询/hsprotect 是跨域 OOPIF，DrissionPage 的 rect.viewport_* 只给
+        「帧内相对坐标」，不折算 iframe 偏移。必须用主页 iframe 的 getBoundingClientRect
+        作偏移，再叠加 #px-captcha 的帧内坐标，才是 CDP 需要的主视口坐标。
+        """
+        # 主页里 验证质询 iframe 的视口位置（真视口坐标）
+        try:
+            off = page.run_js(
+                'var f=document.querySelector(\'iframe[title="验证质询"]\');'
+                'if(!f)return null;var r=f.getBoundingClientRect();'
+                'return [r.x,r.y,r.width,r.height];')
+        except Exception:
+            off = None
+        if not off:
+            return None
+        ox, oy, iw, ih = off
+        # frame1 内 #px-captcha 的帧内相对坐标
+        rel = None
+        try:
+            rel = frame1.run_js(
+                'var c=document.querySelector("#px-captcha")||document.querySelector("[tabindex]");'
+                'if(!c)return null;var r=c.getBoundingClientRect();'
+                'return [r.x,r.y,r.width,r.height];') if frame1 else None
+        except Exception:
+            rel = None
+        if rel and rel[2] and rel[2] > 30:
+            cx = ox + rel[0] + rel[2] / 2.0
+            cy = oy + rel[1] + rel[3] / 2.0
+            w, h = rel[2], rel[3]
+        else:
+            # 回退：按整块挑战 iframe 中心
+            cx, cy = ox + iw / 2.0, oy + ih / 2.0
+            w, h = iw, ih
+        return {'cx': float(cx), 'cy': float(cy), 'w': float(w), 'h': float(h)}
+
+    def _px_probe(self, page, frame1):
+        """轻量探测（避免阻塞微颤）：gone(挑战消失=通过) / success / holding。"""
+        try:
+            if D.count(page, 'iframe[title="验证质询"]') == 0:
+                return 'gone'
+        except Exception:
+            pass
+        try:
+            if 'outlook.live.com' in (page.url or ''):
+                return 'success'
+        except Exception:
+            pass
+        return 'holding'
+
+    def _px_hold_and_watch(self, page, frame1, cx, cy, max_hold_ms=22000):
+        """按住并持续圆周微颤（buttons=1 + force 抖动），轻量轮询成功信号。
+
+        要点：按住期间必须持续微颤、不能被重活（截图/get_frame）打断，否则 PX 视作松手/中断。
+        """
+        start = time.time()
+        last = None
+        next_check = 0.0
+        while (time.time() - start) * 1000 < max_hold_ms:
+            self._circular_tremor(page, cx, cy, duration_ms=300)
+            elapsed = (time.time() - start) * 1000
+            if elapsed >= next_check:
+                next_check = elapsed + 650
+                st = self._px_probe(page, frame1)
+                if st != last:
+                    self._log(f"[PX] {int(elapsed)}ms state={st}")
+                    last = st
+                if st in ('gone', 'success'):
+                    return 'success'
+                if st == 'retry':
+                    return 'retry'
+        return 'timeout'
+
+    def _px_deep_probe(self, page, frame1, tag=''):
+        """一次性深度诊断：坐标映射 + 内层 iframe display + 按钮 rect + 截图。"""
+        try:
+            shot = os.path.join(os.path.dirname(self.log_path), f'pxshot_{tag}.png')
+            page.get_screenshot(path=os.path.dirname(shot), name=os.path.basename(shot), full_page=True)
+            self._log(f"[PXdbg:{tag}] screenshot -> {shot}")
+        except Exception as e:
+            self._log(f"[PXdbg:{tag}] shot err {e}")
+        try:
+            j = page.run_js(
+                'var f=document.querySelector(\'iframe[title="验证质询"]\');'
+                'if(!f)return "no-f";var r=f.getBoundingClientRect();'
+                'return JSON.stringify({x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)});')
+            self._log(f"[PXdbg:{tag}] main-iframe rect={j}")
+        except Exception as e:
+            self._log(f"[PXdbg:{tag}] main err {e}")
+        try:
+            el = D.q(frame1, '#px-captcha', timeout=0)
+            self._log(f"[PXdbg:{tag}] #px-captcha vbox={D.viewport_box(el)}")
+            j = frame1.run_js(
+                'var c=document.querySelector("#px-captcha");'
+                'var f=document.querySelector("iframe");'
+                'var cs=f?getComputedStyle(f):null;var rr=f?f.getBoundingClientRect():null;'
+                'return JSON.stringify({capDisp:c?getComputedStyle(c).display:"?",'
+                'ifrInlineDisp:f?(f.style.display||"(none-inline)"):"no-ifr",'
+                'ifrCompDisp:cs?cs.display:"?",'
+                'ifrRect:rr?[Math.round(rr.x),Math.round(rr.y),Math.round(rr.width),Math.round(rr.height)]:null});')
+            self._log(f"[PXdbg:{tag}] frame1 inner={j}")
+        except Exception as e:
+            self._log(f"[PXdbg:{tag}] frame1 err {e}")
+        try:
+            f = self._resolve_captcha_frames(page)
+            if f:
+                _, frame2 = f
+                j = frame2.run_js(
+                    'var b=document.querySelector("[role=button]");if(!b)return "no-btn";'
+                    'var r=b.getBoundingClientRect();var p=document.querySelector("p");'
+                    'return JSON.stringify({rect:[Math.round(r.x),Math.round(r.y),Math.round(r.width),Math.round(r.height)],'
+                    'cls:b.className,txt:p?p.textContent:""});')
+                self._log(f"[PXdbg:{tag}] frame2 btn={j}")
+        except Exception as e:
+            self._log(f"[PXdbg:{tag}] frame2 err {e}")
+
+    def _solve_px_hold(self, page, frame1):
+        """PerimeterX 按住主循环：接近 → 按下(force) → 长按微颤 → 松开 → 判定，失败重试。"""
+        self._human_prelude(page)
+        if self._px_dbg():
+            self._px_deep_probe(page, frame1, tag='pre')
+        _tries = max(1, self.max_captcha_retries)
+        for attempt in range(_tries):
+            self._log(f"PX Hold {attempt + 1}/{_tries}")
+            frame1 = D.get_frame(page, 'iframe[title="验证质询"]', timeout=2) or frame1
+            box = self._px_press_box(page, frame1)
+            if not box:
+                # 盒子取不到：可能挑战已过（iframe 消失）→ 补判
+                if self._px_gone(page):
+                    self._log("[PX] 挑战已消失（按压盒子取不到），判定通过")
+                    return self._px_win()
+                self._log("[PX] 未取到可按压盒子，等待重试")
+                page.wait(random.uniform(0.8, 1.5))
+                continue
+
+            # 按压点：中心附近抖动（box 已是真实视口坐标 + 尺寸）
+            cx = box['cx'] + random.uniform(-box['w'] * 0.18, box['w'] * 0.18)
+            cy = box['cy'] + random.uniform(-box['h'] * 0.28, box['h'] * 0.28)
+            self._log(f"[PX] press @ ({int(cx)},{int(cy)}) box={int(box['w'])}x{int(box['h'])}")
+
+            # 从远处贝塞尔接近（未按下）
+            fx, fy = cx + random.uniform(-220, 220), cy + random.uniform(-160, 160)
+            D.mouse_move(page, fx, fy, buttons=0)
+            page.wait(random.randint(40, 130) / 1000)
+            self._natural_move(page, fx, fy, cx, cy)
+            page.wait(random.randint(60, 180) / 1000)
+
+            # 按下（带 force）→ 长按微颤 → 松开
+            D.mouse_press(page, cx, cy)
+            result = self._px_hold_and_watch(page, frame1, cx, cy)
+            D.mouse_release(page, cx, cy)
+            self._log(f"[PX] result={result}")
+            if attempt == 0 and self._px_dbg():
+                self._px_deep_probe(page, frame1, tag='post1')
+
+            # 松手后补判：hold 可能刚好在边界完成，给页面时间跳转再看挑战是否消失
+            if result != 'success':
+                page.wait(random.uniform(1.0, 1.6))
+                if self._px_gone(page):
+                    self._log("[PX] 松手后挑战已消失，判定通过")
+                    result = 'success'
+
+            if result == 'success':
+                page.wait(random.uniform(0.6, 1.2))
+                return self._px_win()
+            # timeout / retry：短暂停后再来一轮
+            page.wait(random.uniform(0.9, 2.0))
+
+        with self._state_lock:
+            OutlookController._attempts += 1
+        self.bump_failure('captcha_btn2_appeared_but_failed')
+        self._record_ip('loss')
+        self._print_stats()
+        return False
+
+    def _px_dbg(self):
+        """是否开启 PX 深度诊断（截图/内部 dump）：设环境变量 PX_DEBUG=1 启用。"""
+        return bool(os.environ.get('PX_DEBUG'))
+
+    def _px_gone(self, page):
+        """验证质询挑战是否已从主页消失（=按压通过后被移除）。"""
+        try:
+            return D.count(page, 'iframe[title="验证质询"]') == 0
+        except Exception:
+            return False
+
+    def _px_win(self):
+        """记一次验证码通过：更新统计并返回 True。"""
+        with self._state_lock:
+            OutlookController._attempts += 1
+            OutlookController._success += 1
+        self._record_ip('win')
+        self._print_stats()
+        return True
+
+    # ============================================================
+    # PerimeterX 无障碍(accessibility)备用解法（config: px_solve_mode='a11y'）
+    #   点无障碍「小人」图标 → 等进度条自动走完 → 单击长条确认（无需持续按压）。
+    #   ⚠ PX 内层 UI 为跨域 OOPIF 且类名混淆，下面的候选选择器按已知形态编写；
+    #     首轮会把 frame2 可交互元素 dump 到日志，便于按真实 DOM 收敛选择器。
+    # ============================================================
+    def _frame2_offset(self, page, frame1):
+        """内层 PX UI(frame2) 左上角相对主视口的偏移 (ox, oy)。
+
+        坐标三级折算：主页 iframe[title=验证质询] 偏移 + frame1 内层 iframe 偏移，
+        叠加 frame2 内元素自身 rect，才是 CDP Input 需要的主视口坐标。
+        """
+        try:
+            off = page.run_js(
+                'var f=document.querySelector(\'iframe[title="验证质询"]\');'
+                'if(!f)return null;var r=f.getBoundingClientRect();return [r.x,r.y];')
+        except Exception:
+            off = None
+        if not off:
+            return None
+        inner = None
+        try:
+            inner = frame1.run_js(
+                'var f=document.querySelector(\'iframe[style*="display: block"]\')'
+                '||document.querySelector("#px-captcha iframe")'
+                '||document.querySelector("iframe");'
+                'if(!f)return [0,0];var r=f.getBoundingClientRect();return [r.x,r.y];')
+        except Exception:
+            inner = None
+        if not inner:
+            inner = [0.0, 0.0]
+        return float(off[0]) + float(inner[0]), float(off[1]) + float(inner[1])
+
+    def _px_a11y_locate(self, page, frame1, frame2, selectors):
+        """在 frame2 内按候选选择器找首个可见元素，返回 (sel, cx, cy, w, h) 主视口坐标或 None。"""
+        offset = self._frame2_offset(page, frame1)
+        if not offset:
+            return None
+        ox, oy = offset
+        for sel in selectors:
+            sel_lit = json.dumps(sel)
+            try:
+                rel = frame2.run_js(
+                    'var e=document.querySelector(%s);if(!e)return null;'
+                    'var r=e.getBoundingClientRect();'
+                    'if(r.width<3||r.height<3)return null;'
+                    'return [r.x,r.y,r.width,r.height];' % sel_lit)
+            except Exception:
+                rel = None
+            if rel:
+                return (sel, ox + rel[0] + rel[2] / 2.0, oy + rel[1] + rel[3] / 2.0,
+                        rel[2], rel[3])
+        return None
+
+    def _px_a11y_dump(self, page, frame1, frame2):
+        """全面 dump 无障碍图标候选：main + frame1(验证质询容器) + frame2(内层UI) 三层，
+        列出所有有尺寸(6~320px)的元素(tag/id/class/aria/role/title/cursor/背景图/svg/onclick + box)，
+        按 x 升序——按钮左侧、同一行、最左的小方块通常就是无障碍「小人」图标。
+        用于把真实选择器/坐标钉死（首轮跑一次即可据此收敛 _px_a11y_find_icon）。"""
+        js = (
+            'var out=[];var els=document.querySelectorAll("*");'
+            'for(var i=0;i<els.length;i++){var e=els[i];'
+            'var r=e.getBoundingClientRect();'
+            'if(r.width<6||r.height<6||r.width>320||r.height>220)continue;'
+            'var cs=null;try{cs=getComputedStyle(e);}catch(x){}'
+            'var bg=cs?cs.backgroundImage:"none";'
+            'var svg=(e.tagName==="svg")||!!e.querySelector("svg,img");'
+            'var c=(e.className&&e.className.baseVal!==undefined)?e.className.baseVal:e.className;'
+            'out.push({t:e.tagName,id:(e.id||"").slice(0,16),'
+            'cls:(c||"").toString().slice(0,24),'
+            'role:e.getAttribute("role"),al:e.getAttribute("aria-label"),'
+            'ti:e.getAttribute("title"),'
+            'cur:(cs&&cs.cursor==="pointer")?1:0,'
+            'bg:(bg&&bg!=="none")?1:0,svg:svg?1:0,'
+            'clk:(e.onclick!=null||e.getAttribute("onclick")!=null)?1:0,'
+            'x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)});'
+            '}out.sort(function(a,b){return a.x-b.x;});'
+            'return JSON.stringify(out.slice(0,60));')
+        for name, fr in (('main', page), ('frame1', frame1), ('frame2', frame2)):
+            if not fr:
+                continue
+            try:
+                self._log(f"[PXa11y-dump] {name}={fr.run_js(js)}")
+            except Exception as e:
+                self._log(f"[PXa11y-dump] {name} err {e}")
+
+    def _px_a11y_click_point(self, page, x, y):
+        """CDP 单击某主视口坐标（贝塞尔接近 + 短按松开）。"""
+        fx = x + random.uniform(-160, 160)
+        fy = y + random.uniform(-120, 120)
+        D.mouse_move(page, fx, fy, buttons=0)
+        page.wait(random.randint(40, 120) / 1000)
+        self._natural_move(page, fx, fy, x, y)
+        page.wait(random.randint(60, 160) / 1000)
+        D.mouse_press(page, x, y)
+        page.wait(random.randint(45, 110) / 1000)
+        D.mouse_release(page, x, y)
+
+    def _px_a11y_shot(self, page, name):
+        """PX_DEBUG 诊断截图（仅可视视口，不 resize/scroll，避免污染几何）。"""
+        try:
+            page.get_screenshot(path=os.path.dirname(self.log_path), name=name + '.png')
+            self._log(f"[PXa11y-shot] {name}.png")
+        except Exception as e:
+            self._log(f"[PXa11y-shot] {name} err {e}")
+
+    def _px_a11y_probe_geometry(self, page, frame1, frame2):
+        """定位诊断（首轮跑一次）：记 #px-captcha 真实视口盒 + devicePixelRatio + 全页截图，
+        并无过滤 dump frame2(内层)全部元素(含0×0)、探测是否还有更深 iframe(frame3)。
+        截图 + 已知 #px-captcha 盒 → 可据像素精确量出无障碍图标相对挑战条的横向偏移。"""
+        box = self._px_press_box(page, frame1)
+        try:
+            dpr = page.run_js('return window.devicePixelRatio;')
+        except Exception:
+            dpr = '?'
+        self._log(f"[PXa11y-geo] px-captcha box={box} dpr={dpr}")
+        alljs = (
+            'var out=[];var els=document.querySelectorAll("*");'
+            'for(var i=0;i<els.length&&i<60;i++){var e=els[i];var r=e.getBoundingClientRect();'
+            'var c=(e.className&&e.className.baseVal!==undefined)?e.className.baseVal:e.className;'
+            'out.push({t:e.tagName,role:e.getAttribute("role"),al:e.getAttribute("aria-label"),'
+            'cls:(c||"").toString().slice(0,20),txt:(e.textContent||"").trim().slice(0,16),'
+            'box:[Math.round(r.x),Math.round(r.y),Math.round(r.width),Math.round(r.height)]});}'
+            'return JSON.stringify(out);')
+        try:
+            self._log(f"[PXa11y-geo] frame2-all={frame2.run_js(alljs)}")
+        except Exception as e:
+            self._log(f"[PXa11y-geo] frame2-all err {e}")
+        try:
+            f3 = D.get_frame(frame2, 'iframe', timeout=1)
+            if f3:
+                self._log(f"[PXa11y-geo] frame3-all={f3.run_js(alljs)}")
+            else:
+                self._log("[PXa11y-geo] frame2 无更深 iframe")
+        except Exception as e:
+            self._log(f"[PXa11y-geo] frame3 err {e}")
+        try:
+            shot_dir = os.path.dirname(self.log_path)
+            # 只截可视视口：full_page=True 会 resize/scroll 视口，导致截图后 #px-captcha 盒
+            # 位置被持久平移（实测 cy 442→538），污染随后 _px_a11y_find_icon 的几何定位。
+            page.get_screenshot(path=shot_dir, name='pxa11y_probe.png')
+            self._log(f"[PXa11y-geo] screenshot -> {os.path.join(shot_dir, 'pxa11y_probe.png')}")
+            # 截图后再量一次盒子，确认视口未被截图动过（cy 应与截图前一致）
+            b2 = self._px_press_box(page, frame1)
+            if b2:
+                self._log(f"[PXa11y-geo] box-after-shot cy={b2['cy']:.1f} (截图前应一致)")
+        except Exception as e:
+            self._log(f"[PXa11y-geo] shot err {e}")
+
+    # 无障碍图标相对 #px-captcha 的横向位置比例（0=最左边缘, 0.5=中心）。
+    # 据真机截图 + 已知 #px-captcha 盒(360×42, cx=761.6)量得：图标圆心 CSS-x≈643，
+    # 即 (643-581.6)/360≈0.17；垂直居中(cy)。#px-captcha 是容器，图标+按钮居中其内、图标在左。
+    _PXA11Y_ICON_XFRAC = 0.17
+
+    def _px_layer_offsets(self, page, frame1):
+        """三层 → 主视口坐标偏移：{'main':(0,0),'frame1':(ox,oy),'frame2':(ox2,oy2)}。
+        frame1 偏移=验证质询 iframe 视口位置；frame2 偏移=再叠加内层 iframe 位置。"""
+        offs = {'main': (0.0, 0.0)}
+        try:
+            f1 = page.run_js(
+                'var f=document.querySelector(\'iframe[title="验证质询"]\');'
+                'if(!f)return null;var r=f.getBoundingClientRect();return [r.x,r.y];')
+        except Exception:
+            f1 = None
+        if not f1:
+            return offs
+        offs['frame1'] = (float(f1[0]), float(f1[1]))
+        inner = None
+        try:
+            inner = frame1.run_js(
+                'var f=document.querySelector(\'iframe[style*="display: block"]\')'
+                '||document.querySelector("#px-captcha iframe")'
+                '||document.querySelector("iframe");'
+                'if(!f)return [0,0];var r=f.getBoundingClientRect();return [r.x,r.y];') if frame1 else [0, 0]
+        except Exception:
+            inner = [0, 0]
+        if not inner:
+            inner = [0, 0]
+        offs['frame2'] = (float(f1[0]) + float(inner[0]), float(f1[1]) + float(inner[1]))
+        return offs
+
+    def _px_a11y_find_icon(self, page, frame1, frame2):
+        """定位无障碍「小人」图标 → (desc, cx, cy) 主视口坐标或 None。
+
+        实测（2026-07-26 真机 dump）：PX 内层 UI 是跨域 OOPIF，按钮/图标 getBoundingClientRect
+        多为 0×0；main 层只有微软页 chrome（贪婪 svg 选择器会误命中 Microsoft logo）。唯一可靠锚点
+        是 frame1 内 #px-captcha 的真实视口盒(360×42, _px_press_box 已验证)。故图标按「#px-captcha
+        左端、同高」几何定位，横向比例 _PXA11Y_ICON_XFRAC 据截图量得。仅在 frame1/frame2 试少量
+        无障碍语义选择器作为未来兼容，绝不搜 main。"""
+        for lname, fr in (('frame1', frame1), ('frame2', frame2)):
+            if not fr:
+                continue
+            offs = self._px_layer_offsets(page, frame1)
+            if lname not in offs:
+                continue
+            ox, oy = offs[lname]
+            for sel in ('[aria-label*="ccessib"]', '[aria-label*="无障碍"]',
+                        '[title*="ccessib"]', '[aria-label*="udio"]', '[class*="a11y"]'):
+                sel_lit = json.dumps(sel)
+                try:
+                    rel = fr.run_js(
+                        'var e=document.querySelector(%s);if(!e)return null;'
+                        'var r=e.getBoundingClientRect();'
+                        'if(r.width<6||r.height<6)return null;'
+                        'return [r.x,r.y,r.width,r.height];' % sel_lit)
+                except Exception:
+                    rel = None
+                if rel:
+                    return ("%s:%s" % (lname, sel), ox + rel[0] + rel[2] / 2.0,
+                            oy + rel[1] + rel[3] / 2.0)
+        # 主路径：#px-captcha 左端、同高的几何定位（真实视口坐标可靠）
+        box = self._px_press_box(page, frame1)
+        if box:
+            ix = box['cx'] - box['w'] / 2.0 + box['w'] * self._PXA11Y_ICON_XFRAC
+            return ('geom:px-left', ix, box['cy'])
+        return None
+
+    def _px_a11y_button_text(self, frame1, frame2):
+        """读内层「按住/请稍候/再次按下」按钮当前文案；frame2 优先，失败回退 frame1。"""
+        for fr in (frame2, frame1):
+            if not fr:
+                continue
+            try:
+                t = fr.run_js(
+                    'var b=document.querySelector(\'[role="button"]\')'
+                    '||document.querySelector("button");'
+                    'return b?(b.textContent||"").trim():"";')
+                if t:
+                    return t
+            except Exception:
+                continue
+        return ''
+
+    def _px_a11y_screenshot_np(self, page):
+        """截可视视口 → numpy RGB 数组(H,W,3)。优先 as_bytes 不落盘；失败回退临时文件。
+        PIL/numpy 不可用或截图失败 → None（调用方据此退化为时间兜底）。"""
+        try:
+            from PIL import Image
+            import numpy as np
+            import io
+        except Exception:
+            return None
+        data = None
+        try:
+            data = page.get_screenshot(as_bytes='png')
+        except Exception:
+            data = None
+        if not data:
+            try:
+                d = os.path.dirname(self.log_path)
+                page.get_screenshot(path=d, name='pxa11y_poll.png')
+                with open(os.path.join(d, 'pxa11y_poll.png'), 'rb') as f:
+                    data = f.read()
+            except Exception:
+                return None
+        try:
+            return np.array(Image.open(io.BytesIO(data)).convert('RGB'))
+        except Exception:
+            return None
+
+    def _px_a11y_blue_frac(self, page, box, dpr):
+        """量「按钮区」微软蓝占比。实测(真机截图)：按住≈0.04 / 请稍候(填充中)≈0.14 /
+        再次按下(满格纯蓝#0F6CBD)≈0.80 / 消失≈0.00。box 为 #px-captcha 主视口 CSS 盒，
+        截图为设备像素(=CSS×dpr)。图标在左端(~0.17)，按钮占右侧 0.26~0.98 宽。None=读取失败。"""
+        im = self._px_a11y_screenshot_np(page)
+        if im is None:
+            return None
+        try:
+            import numpy as np
+            H, W = im.shape[:2]
+            cx, cy = box['cx'] * dpr, box['cy'] * dpr
+            w, h = box['w'] * dpr, box['h'] * dpr
+            x0 = max(0, int(cx - w / 2 + 0.26 * w))
+            x1 = min(W, int(cx - w / 2 + 0.98 * w))
+            y0 = max(0, int(cy - h / 2 * 0.7))
+            y1 = min(H, int(cy + h / 2 * 0.7))
+            if x1 <= x0 or y1 <= y0:
+                return None
+            c = im[y0:y1, x0:x1].astype(int)
+            R, G, B = c[..., 0], c[..., 1], c[..., 2]
+            m = (B > 110) & (B > R + 40) & (B > G + 25)
+            return float(m.mean())
+        except Exception:
+            return None
+
+    def _px_a11y_wait_progress(self, page, frame1, frame2, max_ms=26000, min_dwell=6.0):
+        """点无障碍图标后等进度条自动走完。用像素法判定按钮是否已定格「再次按下」——
+        DOM 文案恒为「按住 •••」不可用，可见的「请稍候/再次按下」及进度填充均为 canvas 绘制。
+        判据：按钮区蓝占比 ≥0.70 且相邻三采样稳定(进度停止增长=定格) → 'press_again'。
+        返回 'success'(挑战直接消失) / 'press_again'(满格待补击，含像素读失败时的时间兜底) / 'timeout'。
+        进度期间 frame 可能刷新，故每轮重解析 frames 并早退 px_gone。"""
+        box0 = self._px_press_box(page, frame1)
+        try:
+            dpr = float(page.run_js('return window.devicePixelRatio;') or 1.25)
+        except Exception:
+            dpr = 1.25
+        start = time.time()
+        prev = None
+        stable_hi = 0
+        while (time.time() - start) * 1000 < max_ms:
+            if self._px_gone(page) or self._px_probe(page, frame1) in ('gone', 'success'):
+                return 'success'
+            fr = self._resolve_captcha_frames(page)
+            if fr:
+                frame1, frame2 = fr
+            box = self._px_press_box(page, frame1) or box0
+            bf = self._px_a11y_blue_frac(page, box, dpr) if box else None
+            el = time.time() - start
+            if bf is not None:
+                hi = bf >= 0.70
+                steady = prev is not None and abs(bf - prev) < 0.06
+                stable_hi = (stable_hi + 1) if (hi and steady) else 0
+                prev = bf
+                if self._px_dbg():
+                    self._log(f"[PXa11y] t={el:.1f}s 蓝={bf:.2f} stable={stable_hi}")
+                if el >= min_dwell and stable_hi >= 2:
+                    self._log(f"[PXa11y] 进度条已满(蓝={bf:.2f} t={el:.1f}s)→补击确认")
+                    return 'press_again'
+            page.wait(1.1)
+        # 兜底：实测进度条 ≤~22s 必走完且「再次按下」态持续，像素读失败也补一击（优于放弃）
+        self._log(f"[PXa11y] 像素未判定，按兜底({max_ms}ms)补击确认")
+        return 'press_again'
+
+    def _px_a11y_progress_probe(self, page, frame1, frame2, secs=22):
+        """PX_DEBUG 诊断：点图标后每 2s 采样内层 DOM/CSS，找出反映「请稍候/再次按下」
+        与进度条填充的真实信号（textContent 恒为「按住 •••」，可见文案另有来源）。"""
+        js = r'''
+          var out=[];
+          function push(k,v){ if(v!=null) out.push(k+'='+String(v).slice(0,60)); }
+          var b=document.querySelector('[role="button"]')||document.querySelector('button');
+          if(b){
+            push('tc',(b.textContent||'').trim());
+            push('it',(b.innerText||'').trim());
+            push('al',b.getAttribute('aria-label'));
+            push('bef',getComputedStyle(b,'::before').content);
+            push('aft',getComputedStyle(b,'::after').content);
+          }
+          var all=document.querySelectorAll('*');
+          for(var i=0;i<all.length;i++){
+            var e=all[i];
+            var st=e.getAttribute&&e.getAttribute('style');
+            if(st && /(width|transform|scale|clip)/i.test(st)) push('style<'+e.tagName+'.'+(e.className||'')+'>',st);
+            var t=(e.textContent||'').trim();
+            if(/请稍候|再次|按下|稍候|gain|wait/i.test(t)) push('txt<'+e.tagName+'.'+(e.className||'')+'>',t);
+            try{ var cb=getComputedStyle(e,'::before').content; if(cb && cb!=='none' && cb!=='normal' && cb!=='""') push('bef<'+e.tagName+'>',cb);}catch(_){}
+          }
+          return JSON.stringify(out);
+        '''
+        start = time.time()
+        while time.time() - start < secs:
+            el = int((time.time() - start) * 1000)
+            gone = self._px_gone(page)
+            fr = self._resolve_captcha_frames(page)
+            if fr:
+                frame1, frame2 = fr
+            info = None
+            src = ''
+            for name, f in (('f2', frame2), ('f1', frame1)):
+                if not f:
+                    continue
+                try:
+                    r = f.run_js(js)
+                except Exception as ex:
+                    r = 'err:' + str(ex)[:40]
+                if r and r != '[]':
+                    info, src = r, name
+                    break
+            self._log(f"[PXa11y-prog] t={el} gone={gone} {src}={info}")
+            if gone:
+                return
+            page.wait(2.0)
+
+    def _solve_px_a11y(self, page, frame1):
+        """PerimeterX 无障碍解法（px_solve_mode='a11y'）。据真机截图确认的真实流程：
+        单击按钮左侧的无障碍「小人」图标（点一下，不按住）→ 进度条自动走完 →
+        按钮变「再次按下」→ 单击按钮确认 → 挑战消失即通过。
+        找不到图标入口时退化为按住法(_solve_px_hold)，保证不比默认更差。
+        总尝试次数同样受 max_captcha_retries 约束。
+        """
+        self._human_prelude(page)
+        _tries = max(1, self.max_captcha_retries)
+        for attempt in range(_tries):
+            self._log(f"PX a11y {attempt + 1}/{_tries}")
+            frames = self._resolve_captcha_frames(page)
+            if not frames:
+                if self._px_gone(page):
+                    self._log("[PXa11y] 挑战已消失，判定通过")
+                    return self._px_win()
+                page.wait(random.uniform(0.8, 1.5))
+                continue
+            frame1, frame2 = frames
+
+            if attempt == 0 and self._px_dbg():
+                self._px_a11y_dump(page, frame1, frame2)
+                self._px_a11y_probe_geometry(page, frame1, frame2)
+
+            # ① 找并单击无障碍小人图标（点一下，不按住）
+            icon = self._px_a11y_find_icon(page, frame1, frame2)
+            if not icon:
+                if attempt == 0:
+                    self._log("[PXa11y] 未找到无障碍图标，退化为按住法")
+                    return self._solve_px_hold(page, frame1)
+                page.wait(random.uniform(0.9, 1.6))
+                continue
+            desc, ix, iy = icon
+            self._log(f"[PXa11y] 单击无障碍图标 {desc} @ ({int(ix)},{int(iy)})")
+            if attempt == 0 and self._px_dbg():
+                self._px_a11y_shot(page, 'pxa11y_before_click')
+            self._px_a11y_click_point(page, ix, iy)
+            page.wait(random.uniform(0.5, 1.0))
+            if attempt == 0 and self._px_dbg():
+                self._px_a11y_shot(page, 'pxa11y_after_click')
+
+            # ② 等进度条自动走完（像素法判定按钮变「再次按下」；DOM 文案不可用）
+            prog = self._px_a11y_wait_progress(page, frame1, frame2)
+            self._log(f"[PXa11y] 进度结果={prog}")
+            if attempt == 0 and self._px_dbg():
+                self._px_a11y_shot(page, 'pxa11y_after_progress')
+            if prog == 'success' or self._px_gone(page):
+                self._log("[PXa11y] 进度后挑战消失，判定通过")
+                return self._px_win()
+
+            # ③ 「再次按下」→ 单击 #px-captcha 中心确认（最多补两次，防首击落空）
+            if prog == 'press_again':
+                fr = self._resolve_captcha_frames(page)
+                if fr:
+                    frame1, frame2 = fr
+                for ci in range(2):
+                    box = self._px_press_box(page, frame1)
+                    if not box:
+                        break
+                    self._log(f"[PXa11y] 点「再次按下」确认#{ci + 1} @ ({int(box['cx'])},{int(box['cy'])})")
+                    self._px_a11y_click_point(page, box['cx'], box['cy'])
+                    page.wait(random.uniform(1.0, 1.6))
+                    if attempt == 0 and self._px_dbg():
+                        self._px_a11y_shot(page, f'pxa11y_after_confirm{ci + 1}')
+                    if self._px_gone(page) or self._px_probe(page, frame1) in ('gone', 'success'):
+                        self._log("[PXa11y] 确认后挑战消失，判定通过")
+                        return self._px_win()
+                    fr = self._resolve_captcha_frames(page)
+                    if fr:
+                        frame1, frame2 = fr
+
+            # ④ 判定
+            if self._px_gone(page) or self._px_probe(page, frame1) in ('gone', 'success'):
+                self._log("[PXa11y] 判定通过")
+                return self._px_win()
+            page.wait(random.uniform(0.8, 1.6))
+
+        with self._state_lock:
+            OutlookController._attempts += 1
+        self.bump_failure('captcha_btn2_appeared_but_failed')
+        self._record_ip('loss')
+        self._print_stats()
+        return False
+
 
     def _record_ip(self, result):
         """记录本次运行中IP的表现（仅内存，不持久化）。result: 'win' 或 'loss'"""
@@ -1329,47 +2101,81 @@ class OutlookController:
     # ============================================================
     # iframe / 人类化 / 鼠标移动
     # ============================================================
+    def _resolve_captcha_frames(self, page):
+        """解析嵌套验证码 iframe：外层 title=验证质询 → 内层可见 iframe。返回 (frame1, frame2) 或 None。"""
+        frame1 = D.get_frame(page, 'iframe[title="验证质询"]', timeout=2)
+        if not frame1:
+            return None
+        frame2 = D.get_frame(frame1, 'iframe[style*="display: block"]', timeout=2)
+        if not frame2:
+            # 兜底：取第一个内层 iframe（PX 的「人工验证挑战」/ Arkose 的可见挑战）
+            frame2 = D.get_frame(frame1, 'iframe', timeout=2)
+        if not frame2:
+            return None
+        return frame1, frame2
+
     def _wait_for_captcha_frame(self, page):
-        """轮询等待验证码iframe加载，最多15秒"""
-        for _ in range(15):
+        """轮询等待验证码 iframe 就绪，最多约 20 秒。成功返回 (frame1, frame2)，失败返回 None。
+
+        两类就绪判据：
+        - PerimeterX：frame1 内 #px-captcha 可见（width>30）即可按住。
+        - Arkose：frame2 内出现 circle/svg/可访问性挑战 等可点目标。
+        """
+        px_targets = ['#px-captcha', 'div[id][tabindex]']
+        arkose_targets = ['[aria-label="可访问性挑战"]', 'circle', 'svg', '[role="button"]']
+        for _ in range(20):
             try:
-                # 微软验证码嵌套iframe：外层title="验证质询"，内层style*="display:block"
-                f1 = page.frame_locator('iframe[title="验证质询"]')
-                if f1.locator('iframe').count() > 0:
-                    f2 = f1.frame_locator('iframe[style*="display: block"]')  # 内层可见iframe
-                    for sel in ['[aria-label="可访问性挑战"]', 'circle', 'svg', '[role="button"]']:
+                frames = self._resolve_captcha_frames(page)
+                if frames:
+                    frame1, frame2 = frames
+                    # PX：可见 #px-captcha
+                    for sel in px_targets:
+                        el = D.q(frame1, sel, timeout=0)
+                        box = D.viewport_box(el) if el else None
+                        if box and box['width'] > 30 and box['height'] > 8:
+                            self._log(f"PX挑战就绪: {sel} {int(box['width'])}x{int(box['height'])}")
+                            page.wait(random.randint(400, 1000) / 1000)
+                            return frames
+                    # Arkose：frame2 里的可点目标
+                    for sel in arkose_targets:
                         try:
-                            cnt = f2.locator(sel).count()
-                            if cnt > 0:
-                                box = f2.locator(sel).first.bounding_box()
+                            el = D.q(frame2, sel, timeout=0)
+                            if el:
+                                box = D.viewport_box(el)
                                 if box and box['width'] > 5:
-                                    self._log(f"iframe就绪: {sel}")
-                                    page.wait_for_timeout(random.randint(500, 1500))
-                                    return True
-                        except Exception: continue
-            except Exception: pass
-            page.wait_for_timeout(1000)
-        return False
+                                    self._log(f"Arkose挑战就绪: {sel}")
+                                    page.wait(random.randint(500, 1500) / 1000)
+                                    return frames
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+            page.wait(1.0)
+        return None
 
     def _human_prelude(self, page):
         """验证码前的随机行为：滚动、游荡、停顿、手抖，模拟真人操作"""
         for _ in range(random.randint(1, 4)):
             act = random.random()
             if act < 0.3:
-                page.evaluate(f'window.scrollBy(0, {random.randint(-200, 200)})')
-                page.wait_for_timeout(random.randint(200, 800))
-            elif act < 0.5:
-                page.mouse.move(random.randint(100, 600), random.randint(100, 500), steps=random.randint(3, 8))
-                page.wait_for_timeout(random.randint(300, 1200))
-            elif act < 0.75:
-                page.wait_for_timeout(random.randint(500, 2500))
-            else:
                 try:
-                    pos = page.evaluate('() => ({x: 400 + Math.random()*100, y: 300 + Math.random()*100})')
-                    page.mouse.move(pos['x'], pos['y'], steps=1)
+                    page.run_js(f'window.scrollBy(0, {random.randint(-200, 200)})')
                 except Exception:
                     pass
-                page.wait_for_timeout(random.randint(100, 400))
+                page.wait(random.randint(200, 800) / 1000)
+            elif act < 0.5:
+                D.mouse_move(page, random.randint(100, 600), random.randint(100, 500), buttons=0)
+                page.wait(random.randint(300, 1200) / 1000)
+            elif act < 0.75:
+                page.wait(random.randint(500, 2500) / 1000)
+            else:
+                try:
+                    px = 400 + random.random() * 100
+                    py = 300 + random.random() * 100
+                    D.mouse_move(page, px, py, buttons=0)
+                except Exception:
+                    pass
+                page.wait(random.randint(100, 400) / 1000)
 
     def _natural_move(self, page, x1, y1, x2, y2):
         """三段式人类鼠标轨迹：阶段1 Bezier加速接近(70%步数) → 阶段2 随机过冲 → 阶段3 微调修正"""
@@ -1386,16 +2192,16 @@ class OutlookController:
             bx = (1 - t) ** 2 * x1 + 2 * (1 - t) * t * cpx + t ** 2 * x2
             py = (1 - t) ** 2 * y1 + 2 * (1 - t) * t * cpy + t ** 2 * y2
             px = px * 0.6 + bx * 0.4  # 混合线性进度 + Bezier弯曲
-            page.mouse.move(px, py, steps=1)
-            page.wait_for_timeout(random.randint(6, 18))
+            D.mouse_move(page, px, py, buttons=0)
+            page.wait(random.randint(6, 18) / 1000)
         # 阶段2: 过冲 (超过目标再回来，模拟手没停稳)
         if random.random() < 0.6:
-            page.mouse.move(x2 + random.uniform(2, 8) * random.choice([-1, 1]),
-                            y2 + random.uniform(2, 6) * random.choice([-1, 1]), steps=1)
-            page.wait_for_timeout(random.randint(30, 80))
+            D.mouse_move(page, x2 + random.uniform(2, 8) * random.choice([-1, 1]),
+                         y2 + random.uniform(2, 6) * random.choice([-1, 1]), buttons=0)
+            page.wait(random.randint(30, 80) / 1000)
         # 阶段3: 修正到精确位置
-        page.mouse.move(x2, y2, steps=1)
-        page.wait_for_timeout(random.randint(20, 60))
+        D.mouse_move(page, x2, y2, buttons=0)
+        page.wait(random.randint(20, 60) / 1000)
 
     # ============================================================
     # 目标定位 / 位置 / 按压 / 微颤 / 按钮2
@@ -1405,13 +2211,15 @@ class OutlookController:
         for sel in ['[aria-label="可访问性挑战"]', 'circle', 'ellipse',
                     'svg circle', 'svg ellipse', '[role="button"]', 'svg']:
             try:
-                candidates = frame2.locator(sel)
-                cnt = candidates.count()
+                candidates = D.q_all(frame2, sel)
+                cnt = len(candidates)
                 if cnt > 0:
-                    box = candidates.nth(attempt % min(cnt, 3)).bounding_box()
+                    idx = attempt % min(cnt, 3)
+                    box = D.viewport_box(candidates[idx])
                     if box and box['width'] > 8 and box['height'] > 8:
-                        return box, f"{sel}[{attempt % min(cnt, 3)}/{cnt}]"
-            except Exception: continue
+                        return box, f"{sel}[{idx}/{cnt}]"
+            except Exception:
+                continue
         return None, ""
 
     def _pick_position(self, box, cx, cy):
@@ -1439,12 +2247,15 @@ class OutlookController:
         self._circular_tremor(page, x, y, duration_ms=random.randint(600, 1800))
         appeared = False
         btn2_selectors = ['[aria-label="再次按下"]', '[aria-label*="再次"]', '[aria-label*="按下"]']
-        for sel in btn2_selectors:
-            try:
-                frame2.locator(sel).wait_for(state='visible', timeout=10000)
-                appeared = True
+        # 边微颤边探测 btn2，最多约 10s（保持按住，不松手）
+        for _ in range(20):
+            for sel in btn2_selectors:
+                if D.q(frame2, sel, timeout=0):
+                    appeared = True
+                    break
+            if appeared:
                 break
-            except Exception: continue
+            self._circular_tremor(page, x, y, duration_ms=500)
         if appeared:
             extra_ms = random.randint(1500, 4500)
             self._log(f"btn2出现, 延续{extra_ms}ms")
@@ -1452,15 +2263,15 @@ class OutlookController:
         return appeared
 
     def _circular_tremor(self, page, x, y, duration_ms):
-        """按住期间的圆周微颤，模拟手指自然颤抖"""
+        """按住期间的圆周微颤（buttons=1 + force 抖动），模拟手指自然颤抖与压力变化"""
         steps = max(duration_ms // 50, 5)
         radius = random.uniform(0.3, 2.0)
         for i in range(steps):
             angle = 2 * math.pi * i / steps + random.uniform(-0.3, 0.3)
             tx = x + math.cos(angle) * radius * random.uniform(0.7, 1.3)
             ty = y + math.sin(angle) * radius * random.uniform(0.7, 1.3)
-            page.mouse.move(tx, ty, steps=1)
-            page.wait_for_timeout(random.randint(35, 70))
+            D.mouse_move(page, tx, ty, buttons=1, force=round(random.uniform(0.45, 0.55), 3))
+            page.wait(random.randint(35, 70) / 1000)
 
     def _pick_b2mode(self):
         """轻量延续旧版策略：保留探索，但优先当前运行中表现更好的btn2模式。"""
@@ -1489,29 +2300,39 @@ class OutlookController:
             OutlookController._b2_success[mode] = OutlookController._b2_success.get(mode, 0) + 1
 
     def _execute_b2(self, page, frame2, x, y, bm):
-        """操作按钮2：定位 → 移动 → click或dblclick"""
-        page.wait_for_timeout(random.randint(300, 900))
+        """操作按钮2：定位 → 移动 → click或dblclick（带 force 的 CDP 指针）"""
+        page.wait(random.randint(300, 900) / 1000)
         btn2_selectors = ['[aria-label="再次按下"]', '[aria-label*="再次"]', '[aria-label*="按下"]']
         btn2_box = None
         for sel in btn2_selectors:
             try:
-                btn2_box = frame2.locator(sel).bounding_box()
-                if btn2_box: break
-            except Exception: continue
+                el = D.q(frame2, sel, timeout=0)
+                if el:
+                    btn2_box = D.viewport_box(el)
+                    if btn2_box:
+                        break
+            except Exception:
+                continue
         if not btn2_box:
             return False
         # 在按钮2上随机偏移点击位置
         b2cx, b2cy = btn2_box['x']+btn2_box['width']/2, btn2_box['y']+btn2_box['height']/2
         x2 = b2cx + random.uniform(-btn2_box['width']*0.35, btn2_box['width']*0.35)
         y2 = b2cy + random.uniform(-btn2_box['height']*0.35, btn2_box['height']*0.35)
-        page.mouse.move(x2, y2, steps=random.randint(3, 10))
-        page.wait_for_timeout(random.randint(50, 180))
+        D.mouse_move(page, x2, y2, buttons=0)
+        page.wait(random.randint(50, 180) / 1000)
+
+        def _click(cx, cy):
+            D.mouse_press(page, cx, cy)
+            page.wait(random.randint(30, 70) / 1000)
+            D.mouse_release(page, cx, cy)
+
         if bm == "dblclick":
-            page.mouse.click(x2, y2)
-            page.wait_for_timeout(random.randint(80, 200))
-            page.mouse.click(x2 + random.uniform(-3, 3), y2 + random.uniform(-3, 3))
+            _click(x2, y2)
+            page.wait(random.randint(80, 200) / 1000)
+            _click(x2 + random.uniform(-3, 3), y2 + random.uniform(-3, 3))
         else:
-            page.mouse.click(x2, y2)
+            _click(x2, y2)
         return True
 
     def _check_captcha_result(self, page, frame1, frame2):
@@ -1521,21 +2342,23 @@ class OutlookController:
         - (False, False): 失败/IP被封
         """
         try:
-            page.locator('.draw').wait_for(state="detached")  # 等待加载动画消失
-            try:
-                page.locator('[role="status"][aria-label="正在加载..."]').wait_for(timeout=5000)
-                page.wait_for_timeout(8000)
-                if page.get_by_text('一些异常活动').count() or page.get_by_text('此站点正在维护').count() > 0:
+            if not D.wait_gone(page, '.draw', timeout=15):  # 等待加载动画消失
+                raise TimeoutError('.draw not detached')
+            loading = D.q(page, '[role="status"][aria-label="正在加载..."]', timeout=5)
+            if loading:
+                page.wait(8.0)
+                if D.count(page, 'text:一些异常活动') or D.count(page, 'text:此站点正在维护') > 0:
                     return False, False  # IP被风控
-                if frame2.locator('[aria-label="可访问性挑战"]').count() > 0:
+                if D.count(frame2, '[aria-label="可访问性挑战"]') > 0:
                     return True, True    # 验证码重置，需要重试
                 return True, False        # 验证码通过
-            except Exception:
-                if page.get_by_text('取消').count() > 0:
+            else:
+                if D.count(page, 'text:取消') > 0:
                     return True, False    # 取消按钮出现 → 通过
-                frame1.get_by_text("请再试一次").wait_for(timeout=15000)  # 提示重试
-                return True, True
+                if D.q(frame1, 'text:请再试一次', timeout=15):  # 提示重试
+                    return True, True
+                return False, False       # 无加载/无重试提示/无取消 → 失败（对齐原逻辑）
         except Exception:
-            if page.get_by_text('取消').count() > 0:
+            if D.count(page, 'text:取消') > 0:
                 return True, False
             return False, False           # .draw未消失 → 失败

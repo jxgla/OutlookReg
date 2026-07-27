@@ -1,0 +1,8 @@
+{
+  // 让编辑器把带注释的配置按 JSONC 解析，消除「Comments are not permitted in JSON」误报。
+  // 程序侧 main.py 读取时会先剥掉整行 // 注释再解析，运行不受影响。
+  "files.associations": {
+    "config.json": "jsonc",
+    "config.example.json": "jsonc"
+  }
+}

@@ -12,6 +12,7 @@ DEFAULT_BASE = ""
 DEFAULT_DOMAIN = ""
 DEFAULT_ADMIN = ""
 DEFAULT_PREFIX = "orx"
+_LOCAL_SANITIZE_RE = re.compile(r'[^a-z0-9._-]+', re.I)
 
 # 优先带「验证码/安全代码」上下文的数字，避免误匹配邮箱本地部分里的数字
 _LABELED_CODE_RES = [
@@ -47,11 +48,15 @@ class TempMailClient:
         self._session.headers.update({"User-Agent": "OutlookRegister/1.0"})
 
     def _unique_name(self):
-        # orx + mmddHHMMSS + 线程低位 + 随机，降低多线程碰撞
+        # 优先与当前 Outlook 邮箱名保持一致，仅域名按 temp_mail 配置走；409 撞名时再由 create_address 重试。
+        base = (self.name_prefix or DEFAULT_PREFIX).strip()
+        base = _LOCAL_SANITIZE_RE.sub('', base).strip('._-').lower()
+        if base:
+            return base
         ts = time.strftime("%m%d%H%M%S")
         tid = abs(threading.get_ident()) % 10000
         rnd = "".join(random.choices(string.ascii_lowercase + string.digits, k=4))
-        return f"{self.name_prefix}{ts}{tid:04d}{rnd}"
+        return f"{DEFAULT_PREFIX}{ts}{tid:04d}{rnd}"
 
     def create_address(self, name=None, domain=None):
         """POST /admin/new_address → 本实例独有 address + jwt。"""
@@ -77,6 +82,17 @@ class TempMailClient:
         if not self.jwt:
             raise RuntimeError(f"temp_mail create missing jwt: {data}")
         return self.address, self.jwt
+
+    def session_dict(self):
+        """持久化会话，供 OAuth 冷登录复用同一邮箱接码（jwt 方案）。"""
+        return {
+            "provider": "cloudflare",
+            "address": self.address,
+            "jwt": self.jwt,
+            "base_url": self.base_url,
+            "admin_password": self.admin_password,
+            "domain": self.domain,
+        }
 
     def list_mails(self, limit=20, offset=0):
         """仅用本实例 jwt 拉信，不会读到其它任务邮箱。"""
@@ -201,8 +217,8 @@ class TempMailClient:
         return None
 
 
-def client_from_config(cfg):
-    """从 config['temp_mail'] 构建客户端。未配置时 base/admin/domain 为空。"""
+def _cf_client_from_config(cfg):
+    """从 config['temp_mail'] 构建 cloudflare_temp_email 客户端。"""
     cfg = cfg or {}
     return TempMailClient(
         base_url=(cfg.get("base_url") or "").strip(),
@@ -212,6 +228,38 @@ def client_from_config(cfg):
         enable_prefix=bool(cfg.get("enable_prefix", False)),
         timeout=int(cfg.get("timeout", 30)),
     )
+
+
+def _provider(cfg):
+    """temp_mail.provider：cloudflare(默认) | self(Ryanlyjp/tempmail)。"""
+    return str((cfg or {}).get("provider") or "cloudflare").strip().lower()
+
+
+def client_from_config(cfg):
+    """按 provider 分发接码客户端。两种客户端调用面一致（create_address/wait_for_code/session_dict）。"""
+    if _provider(cfg) in ("self", "ryan", "tempmail"):
+        from controllers import temp_mail_self
+        return temp_mail_self.client_from_config(cfg)
+    return _cf_client_from_config(cfg)
+
+
+def client_from_session(session, cfg):
+    """用绑定阶段保存的会话重建对应 provider 的客户端（冷登录复用同一邮箱）。"""
+    provider = str((session or {}).get("provider") or _provider(cfg)).strip().lower()
+    if provider in ("self", "ryan", "tempmail"):
+        from controllers import temp_mail_self
+        return temp_mail_self.client_from_session(session, cfg)
+    # cloudflare：用保存的 jwt 重建
+    if not session or not session.get("jwt"):
+        return None
+    merged = dict(cfg or {})
+    for k in ("base_url", "admin_password", "domain"):
+        if session.get(k):
+            merged[k] = session[k]
+    client = _cf_client_from_config(merged)
+    client.address = session.get("address")
+    client.jwt = session.get("jwt")
+    return client
 
 
 if __name__ == "__main__":

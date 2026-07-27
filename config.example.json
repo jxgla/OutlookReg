@@ -1,36 +1,127 @@
 {
+  // ===================== OutlookRegister 配置模板 =====================
+  // 复制为 config.json 后按需修改：  copy config.example.json config.json
+  // 支持整行 // 注释（注释必须独占一行，不能跟在值后面，否则会解析失败）。
+
+  // 注册邮箱后缀：@outlook.com 或 @hotmail.com
   "email_suffix": "@outlook.com",
+
+  // 是否无头运行：false=显示浏览器窗口 / true=后台无窗口
   "headless": false,
+
+  // 填表节奏基准(秒)，程序内 ×1000 作为各步等待；越大越像真人但越慢
   "bot_protection_wait": 15,
+
+  // 人机验证「总」尝试次数：如 2 = 按压两次都不过就弃用当前窗口
+  //   （pool/端口模式：记录坏IP并换下一条继续；single 模式：判定此IP不可用并结束运行）
   "max_captcha_retries": 3,
+
+  // 验证码/交接策略：
+  //   0 = 全自动（验证码 + 进邮箱 + OAuth）
+  //   1 = 半自动（你手动过验证码，其余自动）
+  //   2 = 到验证码界面就交人工（该任务不跑 OAuth）
   "captcha_strategy": 0,
+
+  // PX「按住长条」验证码解法：
+  //   "hold" = 按住长条（默认，成功率稳定）
+  //   "a11y" = 无障碍备用法（点无障碍小人图标 → 等进度条自动走完 → 单击长条确认；无需持续按压）
+  "px_solve_mode": "hold",
+
+  // 并发线程数（同时打开的浏览器窗口/任务数）
   "concurrent_flows": 1,
+
+  // 全局提交任务上限；与 success_tasks 任一达标即结束
   "tasks": 1,
+
+  // 全局成功上限：null=不按成功数截断(仍受 tasks 限制)，或填一个数字
   "success_tasks": null,
+
+  // 单批成功上限：达到后重置程序内代理权重/统计并开下一批（不更换固定代理的真实出口 IP）
   "batch_success_limit": 300,
+
+  // ===================== 浏览器 =====================
+  "browser": {
+    // Chrome/Edge 可执行文件路径；留空 = 自动探测系统 Chrome
+    "path": "",
+    // 固定窗口尺寸 [宽, 高]；null = 在若干真实分辨率间随机
+    "window_size": null,
+    // 兜底清理用的 profile 根目录；留空 = 项目内 browser_profiles
+    "user_data_root": "",
+    // 有头时是否挂后台（启动后最小化窗口，不抢前台/焦点；仍是真实 Chrome，反检测不变）。headless 下无意义
+    "background": false,
+    // 是否禁用图片省流量（Blink 层 imagesEnabled=false，图片根本不发请求）；一般不影响流程，异常可关掉
+    "block_images": false
+  },
+
+  // ===================== 代理 =====================
   "proxy": {
+    // 模式：
+    //   "single"   = 固定单端口（用 single_port）
+    //   "multiple" = 端口池（用 port_start ~ port_end）
+    //   "pool"     = 从 pool_file 顺序读代理清单（支持带账密的 socks5，一窗口一代理）
     "mode": "single",
+    // 代理协议（single/multiple 模式用）：http 或 socks5
     "type": "http",
+    // 代理主机（运行前请填写），如 127.0.0.1
     "host": "",
+    // single 模式端口
     "single_port": 0,
+    // multiple 模式起始端口
     "port_start": 0,
+    // multiple 模式结束端口(含)
     "port_end": 0,
-    "max_per_proxy": 20
+    // 单端口进程内最多被选中次数；用满暂不选，全满/批次重置后计数清零
+    "max_per_proxy": 20,
+    // pool 模式：行内未写 scheme 时的默认协议（一般 socks5）
+    "pool_type": "socks5",
+    // pool 模式：代理清单文件（与 config.json 同级），每行一条，支持 user:pass@host:port
+    "pool_file": "proxypool.txt",
+    // pool 模式：前置出墙代理（墙内填本地 7897 等；墙外可留 "" = 直连）
+    "front_proxy": "http://127.0.0.1:7897"
   },
+
+  // ===================== OAuth2（拿 refresh_token）=====================
   "oauth2": {
+    // false = 注册成功即算成功，不拉 token
     "enable_oauth2": true,
+    // 授权用客户端 ID（默认公共 client）
     "client_id": "9e5f94bc-e8a4-4e73-b8be-63364c29d753",
+    // 重定向 URI
     "redirect_url": "http://localhost",
-    "Scopes": ["offline_access", "https://graph.microsoft.com/.default"]
+    // 租户：consumers = 个人账号
+    "tenant": "consumers",
+    // 授权范围（一般 offline_access + Graph 默认范围）
+    "Scopes": ["offline_access", "openid", "profile", "https://graph.microsoft.com/User.Read", "https://graph.microsoft.com/Mail.ReadWrite", "https://graph.microsoft.com/Mail.Send"]
   },
+
+  // ===================== 辅助邮箱绑定 =====================
+  // 仅当微软弹出「让我们来保护你的帐户」且 enabled=true 时使用
   "temp_mail": {
+    // false = 不自动绑定辅助邮箱（出现保护页时走跳过逻辑）
     "enabled": false,
+    // 临时邮箱提供方：cloudflare / self
+    "provider": "cloudflare",
+    // 临时邮箱 API 根地址（不用则留空）
     "base_url": "",
+    // 建地址用的管理员密码（勿公开）
     "admin_password": "",
+    // 新建邮箱域名
     "domain": "",
+    // 本地部分前缀（可选）
     "name_prefix": "",
+    // 是否启用 name_prefix
     "enable_prefix": false,
+    // provider="self" 时的自建服务配置
+    "self": {
+      "base_url": "",
+      "api_key": "",
+      "domain_mode": "random",
+      "domain": "",
+      "name_prefix": ""
+    },
+    // 等待验证码邮件超时(秒)
     "code_timeout": 120,
+    // 轮询收件箱间隔(秒)
     "poll_interval": 3
   }
 }

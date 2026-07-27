@@ -3,12 +3,49 @@ from urllib.parse import parse_qs, quote, urlparse
 
 import requests
 
-# === OAuth2 常量 ===
+from DrissionPage.common import Keys
+
+from controllers import dp_page as D
+
+# === OAuth2 常量（默认值，可被 config['oauth2'] 覆盖，见 configure_oauth2）===
 CLIENT_ID = "9e5f94bc-e8a4-4e73-b8be-63364c29d753"
 REDIRECT_URI = "https://localhost"
 SCOPE = "https://graph.microsoft.com/.default offline_access"
 AUTHORIZE_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
 TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+
+
+def configure_oauth2(cfg):
+    """用 config['oauth2'] 覆盖模块级 OAuth 常量（client_id / redirect_url / Scopes / tenant）。
+
+    启动时调用一次。返回实际生效的 {client_id, redirect_uri, scope, tenant}，供上层（如结果写入）同步。
+    授权与换 token 都读这些模块全局，覆盖后即全链路生效。
+
+    tenant：授权/换 token 端点的租户段。本工具只注册个人 outlook.com 账号，默认 `consumers`
+    （个人账号专属端点，强制个人账号登录、无管理员 → 绕开学校/组织的管理员同意策略）。
+    可选 `common`（个人+组织）/`organizations`/具体 tenant id。
+    """
+    global CLIENT_ID, REDIRECT_URI, SCOPE, AUTHORIZE_URL, TOKEN_URL
+    cfg = cfg or {}
+    cid = str(cfg.get('client_id') or '').strip()
+    if cid:
+        CLIENT_ID = cid
+    ru = str(cfg.get('redirect_url') or cfg.get('redirect_uri') or '').strip()
+    if ru:
+        REDIRECT_URI = ru
+    scopes = cfg.get('Scopes') or cfg.get('scopes')
+    if isinstance(scopes, (list, tuple)):
+        joined = ' '.join(str(s).strip() for s in scopes if str(s).strip())
+        if joined:
+            SCOPE = joined
+    elif isinstance(scopes, str) and scopes.strip():
+        SCOPE = scopes.strip()
+    tenant = str(cfg.get('tenant') or cfg.get('authority') or '').strip().strip('/')
+    if tenant:
+        AUTHORIZE_URL = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize"
+        TOKEN_URL = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+    return {'client_id': CLIENT_ID, 'redirect_uri': REDIRECT_URI, 'scope': SCOPE,
+            'tenant': tenant or 'common', 'authorize_url': AUTHORIZE_URL}
 
 CONSENT_SELECTOR = '[data-testid="appConsentPrimaryButton"]'
 EMAIL_SELECTOR = "#i0116"
@@ -52,6 +89,19 @@ ACCOUNT_TYPE_HINT_TEXTS = [
     "个人账户",
     "Personal account",
 ]
+LOGIN_EMAIL_HINT_TEXTS = [
+    "登录",
+    "sign in",
+    "使用你的 microsoft 帐户",
+    "use your microsoft account",
+    "电子邮件地址、电话或 skype",
+    "电子邮件地址或电话号码",
+    "电子邮件、电话或 skype",
+    "email, phone, or skype",
+    "email address, phone, or skype",
+    "输入电子邮件",
+    "enter email",
+]
 AUTH_NAV_TIMEOUT_MS = 45000
 AUTH_ENTRY_TIMEOUT_MS = 45000
 
@@ -77,46 +127,11 @@ def build_auth_url(prefer_sso=True):
 
 
 def _extract_code_from_url(url):
-    if 'localhost' not in url or 'code=' not in url:
-        return None
-    parsed = urlparse(url)
-    query_params = parse_qs(parsed.query)
-    return query_params.get('code', [None])[0]
+    return D.extract_code_from_url(url)
 
 
 def _wait_for_code_capture(page, captured_code, timeout_ms=180000, poll_ms=250):
-    if captured_code[0]:
-        return captured_code[0]
-    code = _extract_code_from_url(page.url)
-    if code:
-        captured_code[0] = code
-        return code
-    try:
-        js_url = page.evaluate('window.location.href')
-        code = _extract_code_from_url(js_url)
-        if code:
-            captured_code[0] = code
-            return code
-    except Exception:
-        pass
-    deadline = time.time() + timeout_ms / 1000
-    while time.time() < deadline:
-        if captured_code[0]:
-            return captured_code[0]
-        code = _extract_code_from_url(page.url)
-        if code:
-            captured_code[0] = code
-            return code
-        try:
-            js_url = page.evaluate('window.location.href')
-            code = _extract_code_from_url(js_url)
-            if code:
-                captured_code[0] = code
-                return code
-        except Exception:
-            pass
-        page.wait_for_timeout(poll_ms)
-    return None
+    return D.poll_code(page, captured_code, timeout_ms=timeout_ms, poll_ms=poll_ms)
 
 
 def _compact_exc(exc, max_len=180):
@@ -146,7 +161,7 @@ def _wait_for_auth_state_or_code(page, captured_code, timeout_ms=AUTH_ENTRY_TIME
         state = _current_auth_entry_state(page)
         if state != 'unknown' and state not in ignore_states:
             return state
-        page.wait_for_timeout(poll_ms)
+        page.wait(poll_ms/1000)
     if captured_code and _wait_for_code_capture(page, captured_code, timeout_ms=0):
         return 'code'
     state = _current_auth_entry_state(page)
@@ -155,41 +170,33 @@ def _wait_for_auth_state_or_code(page, captured_code, timeout_ms=AUTH_ENTRY_TIME
     return 'unknown'
 
 
-def _locator_visible(locator):
-    try:
-        return locator.count() > 0 and locator.first.is_visible()
-    except Exception:
-        return False
+def _vis(page, sel):
+    """选择器首个匹配是否可见。"""
+    return D.vis(page, sel)
 
 
 def _text_exists(page, text):
-    try:
-        return page.get_by_text(text).count() > 0
-    except Exception:
-        return False
+    return D.text_exists(page, text)
 
 
 def _password_input(page):
-    """密码框：中英 accessible name + 常见 id。"""
+    """密码框：中英 accessible name + 常见 id。返回元素或 None。"""
     for name in ("密码", "Password", "password"):
-        try:
-            loc = page.get_by_role("textbox", name=name)
-            if _locator_visible(loc):
-                return loc
-        except Exception:
-            pass
+        el = D.q(page, f'xpath://input[@type="password" and (@aria-label="{name}" or @placeholder="{name}" or @name="{name}")]')
+        if el and D._displayed(el):
+            return el
     for sel in ("#passwordEntry", "#i0118", 'input[type="password"]'):
-        loc = page.locator(sel)
-        if _locator_visible(loc):
-            return loc
-    return page.get_by_role("textbox", name="密码")
+        el = D.q(page, sel)
+        if el and D._displayed(el):
+            return el
+    return None
 
 
 def _is_account_type_page(page):
     """个人/工作帐户选择页（HRD splitter）。"""
-    if _locator_visible(page.locator(MSA_TILE_SELECTOR)):
+    if _vis(page, MSA_TILE_SELECTOR):
         return True
-    if _locator_visible(page.locator(MSA_TILE_TITLE_SELECTOR)):
+    if _vis(page, MSA_TILE_TITLE_SELECTOR):
         return True
     # 文案兜底：同时出现个人 + 工作/学校 更稳
     has_personal = (
@@ -217,9 +224,9 @@ def _is_protect_account_page(page):
         from controllers.recovery_bind import is_protect_account_page, is_ott_code_page
         return is_protect_account_page(page) or is_ott_code_page(page)
     except Exception:
-        if _locator_visible(page.locator("#EmailAddress")):
+        if _vis(page, "#EmailAddress"):
             return True
-        if _locator_visible(page.locator("#iOttText")):
+        if _vis(page, "#iOttText"):
             return True
         return _text_exists(page, "保护你的帐户") or _text_exists(page, "保护您的帐户")
 
@@ -230,9 +237,9 @@ def _is_proof_verify_page(page):
         from controllers.recovery_bind import is_proof_confirm_page, is_code_entry_page
         return is_proof_confirm_page(page) or is_code_entry_page(page)
     except Exception:
-        if _locator_visible(page.locator("#proof-confirmation-email-input")):
+        if _vis(page, "#proof-confirmation-email-input"):
             return True
-        if _locator_visible(page.locator("#codeEntry-0")):
+        if _vis(page, "#codeEntry-0"):
             return True
         return _text_exists(page, "验证你的电子邮件") or _text_exists(page, "输入你的代码")
 
@@ -245,12 +252,36 @@ def _is_kmsi_only_page(page):
         return _text_exists(page, "保持登录") or _text_exists(page, "Stay signed in")
 
 
+def _is_login_email_page_loose(page):
+    """宽松识别 OAuth 入口邮箱页：有时 #i0116 尚未稳定或状态机短暂给 unknown。"""
+    if _vis(page, EMAIL_SELECTOR):
+        return True
+    try:
+        body = (D.body_text(page, limit=900) or "").strip()
+    except Exception:
+        body = ""
+    body_l = body.lower()
+    hint = any(t in body for t in LOGIN_EMAIL_HINT_TEXTS if any('一' <= c <= '鿿' for c in t))
+    hint = hint or any(t in body_l for t in LOGIN_EMAIL_HINT_TEXTS if not any('一' <= c <= '鿿' for c in t))
+    if not hint:
+        return False
+    if _vis(page, EMAIL_NEXT_SELECTOR):
+        return True
+    try:
+        btn = D.role_button(page, '下一步', timeout=0)
+        if btn and D._displayed(btn):
+            return True
+    except Exception:
+        pass
+    return _text_exists(page, '下一步') or _text_exists(page, 'Next')
+
+
 def _current_auth_entry_state(page):
     """登录页状态机（可见 DOM 锚点，固定优先级）。
 
     consent > account_type > protect_account > proof_verify > kmsi > login_email > login_password > unknown
     """
-    if _locator_visible(page.locator(CONSENT_SELECTOR)):
+    if _vis(page, CONSENT_SELECTOR):
         return 'consent'
     if _is_account_type_page(page):
         return 'account_type'
@@ -260,9 +291,9 @@ def _current_auth_entry_state(page):
         return 'proof_verify'
     if _is_kmsi_only_page(page):
         return 'kmsi'
-    if _locator_visible(page.locator(EMAIL_SELECTOR)):
+    if _is_login_email_page_loose(page):
         return 'login_email'
-    if _locator_visible(_password_input(page)):
+    if _password_input(page) is not None:
         return 'login_password'
     return 'unknown'
 
@@ -276,7 +307,7 @@ def _handle_kmsi(page, log):
                 log('kmsi', '已点保持登录「否」', 'OK')
             else:
                 log('kmsi', '点击「否」失败', 'WARN')
-            page.wait_for_timeout(800)
+            page.wait(0.8)
     except Exception as exc:
         log('kmsi', f'处理异常: {_compact_exc(exc)}', 'WARN')
     return _current_auth_entry_state(page)
@@ -315,49 +346,41 @@ def _handle_proof_verify(page, log, temp_mail_cfg=None, recovery_session=None, f
             except Exception:
                 pass
         log('proof_verify', '辅助邮箱验证失败', 'FAIL')
-    page.wait_for_timeout(500)
+    page.wait(0.5)
     return _current_auth_entry_state(page)
 
 
-def _handle_protect_account(page, log, temp_mail_cfg=None, failure_hook=None, already_bound=False):
-    """OAuth 中的保护帐户页（兜底，非 100% 出现）。
+def _handle_protect_account(page, log, temp_mail_cfg=None, failure_hook=None, already_bound=False, current_email_local=''):
+    """OAuth 中的保护帐户页。
 
-    主路径应在「注册成功 → mail/0 前」完成绑定；此处仅当注册时跳过/失败后才常见。
-    already_bound=True：注册阶段已绑成功，优先点跳过离开，避免重复绑定。
+    whether 注册阶段是否已绑过，只作上下文日志；只要当前页真在保护帐户流，就先按当前 DOM 尝试绑定，
+    失败后才允许走 skip 兜底，避免把 OAuth 真正要求再次验证/绑定的页面直接跳掉。
     """
-    if already_bound:
-        log('protect_account', '注册阶段已绑定过，OAuth 侧优先离开此页', 'INFO')
-        try:
-            if _locator_visible(page.locator('#iShowSkip')):
-                page.locator('#iShowSkip').first.click(timeout=4000)
-                page.wait_for_timeout(800)
-        except Exception:
-            pass
+    if not _is_protect_account_page(page):
         return _current_auth_entry_state(page)
 
-    log('protect_account', 'OAuth 出现保护帐户页（概率事件），尝试绑定', 'WARN')
+    if already_bound:
+        log('protect_account', '注册阶段已有 recovery 记录，但当前 OAuth 页仍要求处理，先按当前页继续绑定/验证', 'WARN')
+    else:
+        log('protect_account', 'OAuth 出现保护帐户页（概率事件），尝试绑定', 'WARN')
+
     cfg = temp_mail_cfg or {}
     ok = False
     if cfg.get('enabled', True):
         try:
             from controllers.recovery_bind import bind_recovery_email
-            result = bind_recovery_email(page, cfg, log=log)
+            result = bind_recovery_email(page, cfg, log=log, local_name=(current_email_local or None))
             if isinstance(result, tuple):
                 ok = bool(result[0])
             else:
                 ok = bool(result)
         except Exception as exc:
-            log('protect_account', f'绑定异常: {exc}', 'FAIL')
+            log('protect_account', f'绑定异常: {_compact_exc(exc)}', 'FAIL')
             ok = False
+
     if ok:
         log('protect_account', 'OAuth 阶段备用邮箱绑定成功', 'OK')
-        page.wait_for_timeout(800)
-        try:
-            if _locator_visible(page.locator('#iShowSkip')):
-                page.locator('#iShowSkip').first.click(timeout=2500)
-                log('protect_account', '绑定后仍有跳过链，已点击', 'INFO')
-        except Exception:
-            pass
+        page.wait(0.8)
     else:
         if failure_hook:
             try:
@@ -365,17 +388,17 @@ def _handle_protect_account(page, log, temp_mail_cfg=None, failure_hook=None, al
             except Exception:
                 pass
         try:
-            if _locator_visible(page.locator('#iShowSkip')):
-                page.locator('#iShowSkip').first.click(timeout=4000)
+            if _vis(page, '#iShowSkip'):
+                D.click_sel(page, '#iShowSkip', timeout=4.0)
                 log('protect_account', 'OAuth 绑定失败，已 #iShowSkip', 'WARN')
-                page.wait_for_timeout(800)
+                page.wait(0.8)
         except Exception as exc:
-            log('protect_account', f'跳过失败: {exc}', 'WARN')
-    page.wait_for_timeout(500)
+            log('protect_account', f'跳过失败: {_compact_exc(exc)}', 'WARN')
+    page.wait(0.5)
     st = _current_auth_entry_state(page)
     if ok and st == 'protect_account':
         try:
-            if not _locator_visible(page.locator('#EmailAddress')) and not _locator_visible(page.locator('#iOttText')):
+            if not _vis(page, '#EmailAddress') and not _vis(page, '#iOttText'):
                 return 'unknown'
         except Exception:
             pass
@@ -390,7 +413,7 @@ def _dump_auth_page(page, log, stage='auth_dump'):
         url = ''
     body = ''
     try:
-        body = (page.locator('body').inner_text(timeout=800) or '')[:240].replace('\n', ' ')
+        body = D.body_text(page, limit=240).replace('\n', ' ')
     except Exception:
         body = ''
     state = _current_auth_entry_state(page)
@@ -403,11 +426,9 @@ def _click_personal_account(page, log=None):
     clicked = False
     # 1) 标准 msa tile
     try:
-        tile = page.locator(MSA_TILE_SELECTOR)
-        if _locator_visible(tile):
-            tile.first.click(timeout=5000)
-            clicked = True
-            if log:
+        if _vis(page, MSA_TILE_SELECTOR):
+            clicked = D.click_sel(page, MSA_TILE_SELECTOR, timeout=5)
+            if clicked and log:
                 log('account_type', '已点击 #msaTile 个人帐户', 'OK')
     except Exception as exc:
         if log:
@@ -416,11 +437,9 @@ def _click_personal_account(page, log=None):
     # 2) 标题区域
     if not clicked:
         try:
-            title = page.locator(MSA_TILE_TITLE_SELECTOR)
-            if _locator_visible(title):
-                title.first.click(timeout=5000)
-                clicked = True
-                if log:
+            if _vis(page, MSA_TILE_TITLE_SELECTOR):
+                clicked = D.click_sel(page, MSA_TILE_TITLE_SELECTOR, timeout=5)
+                if clicked and log:
                     log('account_type', '已点击 #msaTileTitle', 'OK')
         except Exception:
             pass
@@ -429,9 +448,7 @@ def _click_personal_account(page, log=None):
     if not clicked:
         for text in ("个人帐户", "个人账户", "Personal account"):
             try:
-                btn = page.get_by_role("button", name=text)
-                if _locator_visible(btn):
-                    btn.first.click(timeout=5000)
+                if D.click_role_button(page, text, timeout=1):
                     clicked = True
                     if log:
                         log('account_type', f'已点击 button:{text}', 'OK')
@@ -439,10 +456,8 @@ def _click_personal_account(page, log=None):
             except Exception:
                 pass
             try:
-                loc = page.get_by_text(text, exact=False)
-                if _locator_visible(loc):
-                    # 避免点到「重命名你的个人 Microsoft 帐户」链接：优先含 display 的 tile
-                    loc.first.click(timeout=5000)
+                # 避免点到「重命名你的个人 Microsoft 帐户」链接：优先含 display 的 tile
+                if D.click_if_visible(page, f'text:{text}'):
                     clicked = True
                     if log:
                         log('account_type', f'已点击 text:{text}', 'OK')
@@ -452,7 +467,7 @@ def _click_personal_account(page, log=None):
 
     if clicked:
         try:
-            page.wait_for_timeout(1200)
+            page.wait(1.2)
         except Exception:
             pass
     elif log:
@@ -473,7 +488,7 @@ def _resolve_account_type(page, log, captured_code=None, max_rounds=3):
         try:
             _settle_auth_page(page, log, 'account_type')
         except Exception:
-            page.wait_for_timeout(800)
+            page.wait(0.8)
         state = _wait_for_auth_state_or_code(
             page,
             captured_code,
@@ -492,92 +507,62 @@ def _wait_for_auth_entry_state(page, timeout_ms=AUTH_ENTRY_TIMEOUT_MS, poll_ms=5
 
 def _settle_auth_page(page, log, stage, timeout_ms=AUTH_NAV_TIMEOUT_MS):
     try:
-        page.wait_for_load_state('domcontentloaded', timeout=timeout_ms)
+        page.wait.doc_loaded(timeout=timeout_ms / 1000)
     except Exception as e:
-        log(stage, f'等待 domcontentloaded 超时: {e}', 'WARN')
-    try:
-        page.wait_for_load_state('load', timeout=timeout_ms)
-    except Exception as e:
-        log(stage, f'等待 load 超时，继续检测入口: {e}', 'WARN')
-    page.wait_for_timeout(1200)
+        log(stage, f'等待 doc_loaded 超时，继续检测入口: {e}', 'WARN')
+    page.wait(1.2)
 
 
 def _disable_auth_page_autofill(page, log=None):
-    try:
-        page.evaluate(
-            """() => {
-                document.querySelectorAll('input').forEach((el) => {
-                    try {
-                        el.setAttribute('autocomplete', 'off');
-                        el.setAttribute('autocapitalize', 'off');
-                        el.setAttribute('autocorrect', 'off');
-                        el.setAttribute('spellcheck', 'false');
-                        el.setAttribute('data-lpignore', 'true');
-                    } catch (e) {}
-                });
-            }"""
-        )
-        if log:
-            log('autofill', '已尝试关闭页面输入框自动填充提示', 'INFO')
-    except Exception as exc:
-        if log:
-            log('autofill', f'关闭页面自动填充提示失败: {exc}', 'WARN')
+    D.disable_autofill(page)
+    if log:
+        log('autofill', '已尝试关闭页面输入框自动填充提示', 'INFO')
 
 
 def _submit_email_fill(page, full_email):
     _disable_auth_page_autofill(page)
-    locator = page.locator(EMAIL_SELECTOR).first
-    locator.click(timeout=5000)
-    page.keyboard.press("Escape")
-    page.wait_for_timeout(150)
-    locator.fill("")
-    page.wait_for_timeout(100)
-    locator.fill(full_email, timeout=5000)
-    page.wait_for_timeout(300)
-    page.keyboard.press("Escape")
-    page.wait_for_timeout(200)
-    page.locator(EMAIL_NEXT_SELECTOR).click(timeout=5000)
+    el = page.ele('css:' + EMAIL_SELECTOR, timeout=5)
+    el.click()
+    page.actions.type(Keys.ESCAPE)
+    page.wait(0.15)
+    el.clear()
+    page.wait(0.1)
+    el.input(full_email, clear=True)
+    page.wait(0.3)
+    page.actions.type(Keys.ESCAPE)
+    page.wait(0.2)
+    D.click_sel(page, EMAIL_NEXT_SELECTOR, timeout=5)
 
 
 def _submit_email_type(page, full_email):
     _disable_auth_page_autofill(page)
-    locator = page.locator(EMAIL_SELECTOR).first
-    locator.click(timeout=5000)
-    page.keyboard.press("Control+A")
-    page.keyboard.press("Backspace")
-    page.wait_for_timeout(100)
-    locator.type(full_email, delay=35, timeout=10000)
-    page.wait_for_timeout(250)
-    page.keyboard.press("Escape")
-    page.wait_for_timeout(200)
-    page.locator(EMAIL_NEXT_SELECTOR).click(timeout=5000)
+    el = page.ele('css:' + EMAIL_SELECTOR, timeout=5)
+    el.click()
+    el.clear()
+    page.wait(0.1)
+    # 真实逐键输入（比 JS 注入更像人）
+    page.actions.click(el).type(full_email)
+    page.wait(0.25)
+    page.actions.type(Keys.ESCAPE)
+    page.wait(0.2)
+    D.click_sel(page, EMAIL_NEXT_SELECTOR, timeout=5)
 
 
 def _submit_email_js_exact(page, full_email):
-    page.wait_for_selector(EMAIL_SELECTOR, state="visible", timeout=10000)
+    # 保留名字以兼容方法表；改为真实输入（不再走原生 setter 注入）
+    el = page.ele('css:' + EMAIL_SELECTOR, timeout=10)
     _disable_auth_page_autofill(page)
-    page.eval_on_selector(
-        EMAIL_SELECTOR,
-        """(el, value) => {
-            el.focus();
-            el.setAttribute('autocomplete', 'off');
-            const nativeInputValueSetter =
-                Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-            nativeInputValueSetter.call(el, value);
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-            el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
-        }""",
-        full_email,
-    )
-    page.wait_for_timeout(500)
-    page.keyboard.press("Escape")
-    page.wait_for_timeout(200)
-    page.locator(EMAIL_NEXT_SELECTOR).click(timeout=5000)
+    el.click()
+    el.input(full_email, clear=True)
+    page.wait(0.5)
+    page.actions.type(Keys.ESCAPE)
+    page.wait(0.2)
+    D.click_sel(page, EMAIL_NEXT_SELECTOR, timeout=5)
 
 
 def _submit_email(page, full_email, log):
-    page.wait_for_selector(EMAIL_SELECTOR, state="visible", timeout=10000)
+    if not D.q(page, EMAIL_SELECTOR, timeout=10):
+        raise RuntimeError("邮箱框未出现")
     methods = [
         ("fill", _submit_email_fill),
         ("type", _submit_email_type),
@@ -596,13 +581,14 @@ def _submit_email(page, full_email, log):
                     cur = _resolve_account_type(page, log)
                 log('oauth_email', f"提交前已在阶段={cur}", 'OK')
                 return cur
-            if page.locator(EMAIL_SELECTOR).count() == 0:
+            if D.count(page, EMAIL_SELECTOR) == 0:
                 cur = _current_auth_entry_state(page)
                 if cur == 'account_type':
                     cur = _resolve_account_type(page, log)
                 return cur
-            current = page.eval_on_selector(EMAIL_SELECTOR, "(el) => (el.value || '').trim()")
-            log('oauth_email', f"尝试 {name}，提交前值={current!r}", 'INFO')
+            cur_el = D.q(page, EMAIL_SELECTOR)
+            current = (cur_el.property('value') if cur_el else '') or ''
+            log('oauth_email', f"尝试 {name}，提交前值={current.strip()!r}", 'INFO')
             method(page, full_email)
             stage = _wait_for_auth_entry_state(page, timeout_ms=12000)
             last_stage = stage
@@ -612,10 +598,11 @@ def _submit_email(page, full_email, log):
             if stage in ('login_password', 'consent', 'code', 'protect_account'):
                 log('oauth_email', f"{name} 成功进入阶段={stage}", 'OK')
                 return stage
-            still_here = page.locator(EMAIL_SELECTOR).count() > 0 and page.locator(EMAIL_SELECTOR).first.is_visible()
+            still_here = _vis(page, EMAIL_SELECTOR)
             err = ""
             if still_here:
-                err = page.eval_on_selector("#usernameError", "(el) => (el.innerText || '').trim()") if page.locator("#usernameError").count() > 0 else ""
+                err_el = D.q(page, "#usernameError")
+                err = (err_el.text if err_el else "") or ""
             log('oauth_email', f"{name} 后仍未进入下一阶段 stage={stage} error={err!r}", 'WARN')
         except Exception as exc:
             last_error = exc
@@ -641,18 +628,14 @@ def _submit_email(page, full_email, log):
 def _click_use_password(page):
     for text in PASSWORD_BYPASS_TEXTS:
         try:
-            btn = page.get_by_role("button", name=text)
-            if btn.count() > 0 and btn.first.is_visible():
-                btn.first.click(timeout=5000)
-                page.wait_for_timeout(1500)
+            if D.click_role_button(page, text, timeout=0):
+                page.wait(1.5)
                 return
         except Exception:
             pass
         try:
-            btn = page.get_by_text(text)
-            if btn.count() > 0 and btn.first.is_visible():
-                btn.first.click(timeout=5000)
-                page.wait_for_timeout(1500)
+            if D.click_if_visible(page, f'text:{text}'):
+                page.wait(1.5)
                 return
         except Exception:
             pass
@@ -662,26 +645,28 @@ def _describe_password_candidates(page):
     parts = []
     for selector in ('#passwordEntry', '#i0118', 'input[type="password"]'):
         try:
-            locator = page.locator(selector)
-            count = locator.count()
+            items = D.q_all(page, selector)
+            count = len(items)
             rows = []
-            for idx in range(count):
-                item = locator.nth(idx)
+            for idx, item in enumerate(items):
                 try:
-                    visible = item.is_visible()
+                    visible = item.states.is_displayed
                 except Exception as exc:
                     visible = f"err:{exc.__class__.__name__}"
                 try:
-                    meta = item.evaluate(
-                        """(el) => ({
-                            id: el.id || '',
-                            name: el.name || '',
-                            type: el.getAttribute('type') || '',
-                            tabindex: el.getAttribute('tabindex') || '',
-                            ariaHidden: el.getAttribute('aria-hidden') || '',
-                            readonly: el.hasAttribute('readonly'),
-                            disabled: !!el.disabled
-                        })"""
+                    meta = item.run_js(
+                        """function() {
+                            const el = this;
+                            return {
+                                id: el.id || '',
+                                name: el.name || '',
+                                type: el.getAttribute('type') || '',
+                                tabindex: el.getAttribute('tabindex') || '',
+                                ariaHidden: el.getAttribute('aria-hidden') || '',
+                                readonly: el.hasAttribute('readonly'),
+                                disabled: !!el.disabled
+                            };
+                        }"""
                     )
                 except Exception:
                     meta = {}
@@ -698,21 +683,15 @@ def _password_locator(page, log, timeout_ms=15000):
     while time.time() < deadline:
         _click_use_password(page)
         for selector in ('#passwordEntry', '#i0118', 'input[type="password"]'):
-            try:
-                locator = page.locator(selector)
-                count = locator.count()
-            except Exception:
-                continue
-            for idx in range(count):
-                item = locator.nth(idx)
+            for idx, item in enumerate(D.q_all(page, selector)):
                 try:
-                    if item.is_visible():
+                    if item.states.is_displayed:
                         log('oauth_password', f"使用密码框 {selector}[{idx}]", 'INFO')
                         return item, f"{selector}[{idx}]"
                 except Exception:
                     continue
         last_snapshot = _describe_password_candidates(page)
-        page.wait_for_timeout(300)
+        page.wait(0.3)
     raise RuntimeError(f"未找到可见密码框：{last_snapshot}")
 
 
@@ -721,32 +700,46 @@ def _submit_password(page, password, log):
     _disable_auth_page_autofill(page)
     log('oauth_password', f"密码候选快照：{_describe_password_candidates(page)}", 'INFO')
     locator, locator_name = _password_locator(page, log=log, timeout_ms=15000)
-    locator.evaluate(
-        """(el, value) => {
-            el.focus();
-            el.removeAttribute('readonly');
-            el.removeAttribute('aria-hidden');
-            el.style.opacity = '1';
-            el.style.pointerEvents = 'auto';
-            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-            setter.call(el, value);
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-        }""",
-        password,
-    )
-    page.wait_for_timeout(200)
+    # 清 readonly/aria-hidden 后走真实输入（不再原生 setter 注入）
     try:
-        filled_len = locator.evaluate("(el) => (el.value || '').length")
+        locator.run_js(
+            """function() {
+                const el = this;
+                el.removeAttribute('readonly');
+                el.removeAttribute('aria-hidden');
+                el.style.opacity = '1';
+                el.style.pointerEvents = 'auto';
+            }"""
+        )
+    except Exception:
+        pass
+    try:
+        locator.click()
+        locator.input(password, clear=True)
+    except Exception:
+        try:
+            page.actions.click(locator).type(password)
+        except Exception:
+            pass
+    page.wait(0.2)
+    try:
+        filled_len = len(locator.property('value') or '')
         log('oauth_password', f"{locator_name} 已写入密码，长度={filled_len}", 'INFO')
     except Exception:
         log('oauth_password', f"{locator_name} 已写入密码", 'INFO')
-    page.wait_for_timeout(400)
+    page.wait(0.4)
     try:
-        page.get_by_test_id("primaryButton").click(timeout=5000)
-        log('oauth_password', "点击 data-testid=primaryButton 提交密码", 'INFO')
+        btn = D.q(page, '[data-testid="primaryButton"]', timeout=5)
+        if btn:
+            btn.click()
+            log('oauth_password', "点击 data-testid=primaryButton 提交密码", 'INFO')
+        else:
+            raise RuntimeError('no primaryButton')
     except Exception:
-        page.keyboard.press("Enter")
+        try:
+            page.actions.type(Keys.ENTER)
+        except Exception:
+            pass
         log('oauth_password', "主按钮点击失败，改用 Enter 提交密码", 'WARN')
 
 
@@ -770,7 +763,7 @@ def _has_unknown_account(page):
         or _text_exists(page, '找不到使用该用户名的账户')
         or _text_exists(page, "We couldn't find an account with that username")
         or _text_exists(page, "That Microsoft account doesn't exist")
-        or _locator_visible(page.locator('#usernameError'))
+        or _vis(page, '#usernameError')
     )
 
 
@@ -795,21 +788,29 @@ def _dismiss_passkey_setup(page, log=None):
         return False
     if log:
         log('passkey', f'检测到密钥设置页 url={url[:120]}', 'WARN')
-    for text in ('取消', 'Cancel', '以后再说', 'Not now', '暂时跳过', 'Skip'):
+    # 优先点页面内「跳过」链（微软 passkey 页常见 id），这样连虚拟认证器都不必触发、不创建 passkey
+    for sel in ('#iCancel', '#iShowSkip', '#idBtn_Back'):
         try:
-            if _locator_visible(page.get_by_role('button', name=text)):
-                page.get_by_role('button', name=text).first.click(timeout=3000)
-                page.wait_for_timeout(1000)
+            if _vis(page, sel) and D.click_sel(page, sel, timeout=2.0):
+                page.wait(1)
+                if log:
+                    log('passkey', f'已点击跳过 {sel}', 'OK')
+                return True
+        except Exception:
+            pass
+    for text in ('暂时跳过', '现在跳过', '跳过', '以后再说', '取消', 'Skip for now',
+                 'Maybe later', 'Not now', 'Cancel', 'Skip'):
+        try:
+            if D.click_role_button(page, text, timeout=0):
+                page.wait(1)
                 if log:
                     log('passkey', f'已点击 {text}', 'OK')
                 return True
         except Exception:
             pass
         try:
-            loc = page.locator(f'input[type="button"][value="{text}"]')
-            if _locator_visible(loc):
-                loc.first.click(timeout=3000)
-                page.wait_for_timeout(1000)
+            if D.click_if_visible(page, f'input[type="button"][value="{text}"]'):
+                page.wait(1)
                 if log:
                     log('passkey', f'已点击 input {text}', 'OK')
                 return True
@@ -817,8 +818,8 @@ def _dismiss_passkey_setup(page, log=None):
             pass
     # 最后：若仍在 fido 页，直接跳回我们的 authorize（依赖 cookie）
     try:
-        page.goto(build_auth_url(prefer_sso=True), timeout=AUTH_NAV_TIMEOUT_MS, wait_until='domcontentloaded')
-        page.wait_for_timeout(1200)
+        page.get(build_auth_url(prefer_sso=True))
+        page.wait(1.2)
         if log:
             log('passkey', '密钥页无法取消，已回跳 authorize', 'WARN')
         return True
@@ -829,17 +830,13 @@ def _dismiss_passkey_setup(page, log=None):
 def _run_cookie_recovery(page, auth_url, log, entry_timeout_ms=AUTH_ENTRY_TIMEOUT_MS):
     last_state = 'unknown'
     for method_name, action in [
-        ('reload', lambda: page.reload(wait_until="domcontentloaded", timeout=AUTH_NAV_TIMEOUT_MS)),
-        ('location.reload', lambda: page.evaluate("() => location.reload()")),
-        ('goto', lambda: page.goto(auth_url, timeout=AUTH_NAV_TIMEOUT_MS, wait_until="domcontentloaded")),
+        ('reload', lambda: page.refresh()),
+        ('location.reload', lambda: page.run_js("location.reload()")),
+        ('goto', lambda: page.get(auth_url)),
     ]:
         log('cookie_recovery', f'执行 {method_name}', 'WARN')
         try:
-            if method_name == 'location.reload':
-                with page.expect_navigation(wait_until="domcontentloaded", timeout=AUTH_NAV_TIMEOUT_MS):
-                    action()
-            else:
-                action()
+            action()
         except Exception as e:
             log('cookie_recovery', f'{method_name} 失败: {e}', 'WARN')
             continue
@@ -865,6 +862,7 @@ def _run_cookie_recovery(page, auth_url, log, entry_timeout_ms=AUTH_ENTRY_TIMEOU
 def _digest_post_email_states(
     page, log, state, captured_code=None, temp_mail_cfg=None,
     recovery_already_bound=False, recovery_session=None, failure_hook=None, rounds=4,
+    current_email_local='',
 ):
     """邮箱提交后可能出现的中间页：帐户类型 / 绑定保护 / 验证辅助邮箱 / 密钥 / KMSI。"""
     for _ in range(rounds):
@@ -875,7 +873,7 @@ def _digest_post_email_states(
         if state == 'protect_account':
             state = _handle_protect_account(
                 page, log, temp_mail_cfg=temp_mail_cfg, failure_hook=failure_hook,
-                already_bound=recovery_already_bound,
+                already_bound=recovery_already_bound, current_email_local=current_email_local,
             )
             log('protect_account', f'处理后状态={state}', 'INFO')
             continue
@@ -911,10 +909,11 @@ def _perform_login_after_cookie_fail(
     page, full_email, password, log, failure_hook=None, state='login_email',
     captured_code=None, temp_mail_cfg=None, recovery_already_bound=False, recovery_session=None,
 ):
+    current_email_local = (str(full_email or '').split('@', 1)[0]).strip()
     state = _digest_post_email_states(
         page, log, state, captured_code=captured_code, temp_mail_cfg=temp_mail_cfg,
         recovery_already_bound=recovery_already_bound, recovery_session=recovery_session,
-        failure_hook=failure_hook, rounds=4,
+        failure_hook=failure_hook, rounds=4, current_email_local=current_email_local,
     )
 
     if state == 'login_email':
@@ -936,7 +935,7 @@ def _perform_login_after_cookie_fail(
         state = _digest_post_email_states(
             page, log, state, captured_code=captured_code, temp_mail_cfg=temp_mail_cfg,
             recovery_already_bound=recovery_already_bound, recovery_session=recovery_session,
-            failure_hook=failure_hook, rounds=4,
+            failure_hook=failure_hook, rounds=4, current_email_local=current_email_local,
         )
         log('login_email', f'邮箱提交后状态={state}', 'INFO')
         if _has_unknown_account(page):
@@ -984,7 +983,7 @@ def _perform_login_after_cookie_fail(
         state = _digest_post_email_states(
             page, log, state, captured_code=captured_code, temp_mail_cfg=temp_mail_cfg,
             recovery_already_bound=recovery_already_bound, recovery_session=recovery_session,
-            failure_hook=failure_hook, rounds=4,
+            failure_hook=failure_hook, rounds=4, current_email_local=current_email_local,
         )
         log('login_password', f'密码提交后状态={state}', 'INFO')
         if state == 'code':
@@ -1012,7 +1011,7 @@ def _perform_login_after_cookie_fail(
         state = _digest_post_email_states(
             page, log, state, captured_code=captured_code, temp_mail_cfg=temp_mail_cfg,
             recovery_already_bound=recovery_already_bound, recovery_session=recovery_session,
-            failure_hook=failure_hook, rounds=4,
+            failure_hook=failure_hook, rounds=4, current_email_local=current_email_local,
         )
         log('proof_verify', f'proof/kmsi 处理后状态={state}', 'INFO')
         if state == 'login_password':
@@ -1119,9 +1118,18 @@ def _exchange_code_with_retry(code, log, failure_hook=None, current_proxy="", to
 
 
 def _click_consent_and_exchange(page, captured_code, log, failure_hook=None, current_proxy="", token_proxy_getter=None):
-    accept_btn = page.locator(CONSENT_SELECTOR)
-    accept_btn.wait_for(state='visible', timeout=60000)
-    accept_btn.click(timeout=10000)
+    # 点同意前先开监听，确保抓到跳转 localhost 的回调
+    D.start_code_listen(page)
+    accept_btn = page.ele('css:' + CONSENT_SELECTOR, timeout=60)
+    if not accept_btn:
+        if failure_hook:
+            failure_hook('oauth_consent_fail')
+        log('consent', '同意按钮未出现', 'FAIL')
+        return False, None
+    try:
+        accept_btn.click()
+    except Exception:
+        accept_btn.click(by_js=True)
     log('consent', '点击接受授权', 'OK')
 
     code = _wait_for_code_capture(page, captured_code, timeout_ms=180000)
@@ -1158,6 +1166,7 @@ def _exchange_captured_code(page, captured_code, log, failure_hook=None, current
 def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', backup_proxy=None, failure_hook=None, log_hook=None, current_proxy="", token_proxy_getter=None, temp_mail_cfg=None, recovery_already_bound=False, recovery_session=None):
     # 同 context 必须 prefer_sso：不要 sso_reload，否则 cookie 会话被强制打断
     auth_url = build_auth_url(prefer_sso=True)
+    current_email_local = (str(full_email or '').split('@', 1)[0]).strip()
 
     def _log(stage, message, level='INFO'):
         if log_hook:
@@ -1169,25 +1178,15 @@ def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', ba
     def _try_flow():
         _log('start', '开始 OAuth2 (同浏览器 context 复用 cookie，无 sso_reload)')
         # 同一 BrowserContext 新开 tab，共享注册后的 login.live.com cookie
-        pg = page.context.new_page()
+        pg = page.browser.new_tab()
+        D.prepare_tab(pg)
         captured_code = [None]
-
-        def on_request(request):
-            code = _extract_code_from_url(request.url)
-            if code:
-                captured_code[0] = code
-
-        def on_frame_navigated(frame):
-            code = _extract_code_from_url(frame.url)
-            if code:
-                captured_code[0] = code
-
-        pg.on('request', on_request)
-        pg.on('framenavigated', on_frame_navigated)
+        # 监听跳转到 localhost 的 OAuth 回调（含 code）
+        D.start_code_listen(pg)
 
         try:
             t1 = time.time()
-            pg.goto(auth_url, timeout=AUTH_NAV_TIMEOUT_MS, wait_until="domcontentloaded")
+            pg.get(auth_url)
             _settle_auth_page(pg, _log, 'goto')
             _disable_auth_page_autofill(pg, _log)
             _log('goto', f"进入auth页面 (+{time.time()-t1:.0f}s)")
@@ -1202,7 +1201,7 @@ def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', ba
             if state == 'protect_account':
                 state = _handle_protect_account(
                     pg, _log, temp_mail_cfg=temp_mail_cfg, failure_hook=failure_hook,
-                    already_bound=recovery_already_bound,
+                    already_bound=recovery_already_bound, current_email_local=current_email_local,
                 )
                 _log('entry', f'保护帐户处理后状态={state}')
             if state == 'proof_verify':
@@ -1234,12 +1233,18 @@ def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', ba
                     )
                 elif _is_kmsi_only_page(pg):
                     state = _handle_kmsi(pg, _log)
+                elif _is_login_email_page_loose(pg):
+                    state = 'login_email'
+                    _log('entry', 'unknown 实为邮箱登录页：同页补登当前邮箱', 'WARN')
                 else:
                     _log('entry', 'unknown：单次 goto 重试 authorize', 'WARN')
                     try:
-                        pg.goto(auth_url, timeout=AUTH_NAV_TIMEOUT_MS, wait_until="domcontentloaded")
+                        pg.get(auth_url)
                         _settle_auth_page(pg, _log, 'goto_retry')
                         state = _wait_for_auth_state_or_code(pg, captured_code, timeout_ms=15000)
+                        if state == 'unknown' and _is_login_email_page_loose(pg):
+                            state = 'login_email'
+                            _log('entry', 'goto 后识别为邮箱登录页：同页补登当前邮箱', 'WARN')
                     except Exception as exc:
                         _log('entry', f'goto 重试失败: {_compact_exc(exc)}', 'WARN')
                 _log('entry', f'处理后状态={state}')
@@ -1249,7 +1254,7 @@ def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', ba
             if state == 'protect_account':
                 state = _handle_protect_account(
                     pg, _log, temp_mail_cfg=temp_mail_cfg, failure_hook=failure_hook,
-                    already_bound=recovery_already_bound,
+                    already_bound=recovery_already_bound, current_email_local=current_email_local,
                 )
             if state == 'proof_verify':
                 state = _handle_proof_verify(
@@ -1311,8 +1316,7 @@ def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', ba
             return False, None
         finally:
             try:
-                pg.remove_listener('request', on_request)
-                pg.remove_listener('framenavigated', on_frame_navigated)
+                pg.listen.stop()
             except Exception:
                 pass
             try:

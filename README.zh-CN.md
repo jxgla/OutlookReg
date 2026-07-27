@@ -1,7 +1,7 @@
 <h1 align="center">OutlookRegister</h1>
 
 <p align="center">
-  Outlook / Hotmail 自动注册，并获取 Microsoft Graph OAuth2 <code>refresh_token</code>（基于 patchright 浏览器自动化）。
+  Outlook / Hotmail 自动注册，并获取 Microsoft Graph OAuth2 <code>refresh_token</code>（基于 DrissionPage 驱动本机 Chrome 自动化）。
 </p>
 
 <p align="center">
@@ -13,7 +13,7 @@
 <p align="center">
   <img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white">
   <img alt="License MIT" src="https://img.shields.io/badge/License-MIT-green.svg">
-  <img alt="patchright" src="https://img.shields.io/badge/Browser-patchright-4B5563">
+  <img alt="DrissionPage" src="https://img.shields.io/badge/Browser-DrissionPage-4B5563">
   <img alt="Platform" src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-blue">
 </p>
 
@@ -27,6 +27,7 @@
 ### 1. 环境要求
 
 - 建议 Python 3.10+  
+- **本机已安装 Google Chrome**（DrissionPage 驱动系统 Chrome，非 bundled Chromium）  
 - 可用的 HTTP/SOCKS 代理（强烈建议）  
 - 若开启辅助邮箱绑定：兼容的临时邮箱 / CF Temp Mail 类 API  
 
@@ -36,7 +37,8 @@
 git clone <本仓库地址>
 cd OutlookRegister
 pip install -r requirements.txt
-patchright install chromium
+# 无需再单独安装浏览器内核；确保本机已装 Chrome 即可
+# 如 Chrome 不在默认路径，可在 config.json 的 browser.path 指定 chrome.exe
 ```
 
 ### 3. 配置
@@ -69,7 +71,7 @@ python main.py
 
 ## `config.json` 字段说明
 
-模板见 `config.example.json`（与空的 `config.json` 结构一致）。
+模板见 `config.example.json`（与空的 `config.json` 结构一致）。两个文件都支持**整行 `//` 注释**（程序读取时会先剥掉再解析；随附 `.vscode/settings.json` 把它们按 JSONC 处理，编辑器不再报错）。
 
 ### 顶层字段
 
@@ -78,15 +80,25 @@ python main.py
 | `email_suffix` | string | 注册邮箱后缀，如 `@outlook.com` 或 `@hotmail.com`。 |
 | `headless` | bool | `false` 显示浏览器窗口；`true` 无头。 |
 | `bot_protection_wait` | number | 填表节奏基准（秒）。代码内会 ×1000 作为等待。 |
-| `max_captcha_retries` | number | 验证码按压额外重试次数（约 `max_captcha_retries + 1` 轮 Hold）。 |
+| `max_captcha_retries` | number | 验证码按压总尝试次数（如 `2` = 按压两次都不过就弃用当前窗口；single 模式则判定此IP不可用并结束运行）。 |
 | `captcha_strategy` | number | 验证码/交接策略，见下表。 |
+| `px_solve_mode` | string | PX「按住」验证码解法：`"hold"`（默认，成功率稳定）或 `"a11y"`（无障碍备用：点无障碍小人图标→等进度条走完→点长条确认）。 |
 | `concurrent_flows` | number | 并发线程数（同时打开的浏览器任务数）。 |
 | `tasks` | number | 全局提交任务上限；与 `success_tasks` **任一达标**即结束。 |
 | `success_tasks` | number \| null | 全局成功上限。`null` = 不按成功数截断（仍受 `tasks` 限制）。 |
 | `batch_success_limit` | number | 单批成功数上限；达到后重置程序内代理权重/统计并开下一批。累计成功/耗时保留。**不会**更换固定代理的真实出口 IP。 |
+| `browser` | object | 可选：浏览器路径 / 窗口尺寸。见下表。 |
 | `proxy` | object | 代理配置（正式使用必填）。 |
 | `oauth2` | object | Graph OAuth2 配置。 |
 | `temp_mail` | object | 可选：保护帐户页自动绑定辅助邮箱。 |
+
+### `browser`（可选）
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `path` | string | Chrome/Edge 可执行文件路径；留空则 DrissionPage 自动探测系统 Chrome。 |
+| `window_size` | [w, h] \| null | 固定窗口尺寸（内外一致，避免 viewport 随机化指纹）；`null` 则在若干真实分辨率间随机。 |
+| `user_data_root` | string | 兜底清理用的 profile 根目录（DrissionPage 实际用临时目录，退出随浏览器删除）。 |
 
 ### `captcha_strategy`
 
@@ -100,7 +112,7 @@ python main.py
 
 | 字段 | 类型 | 含义 |
 | --- | --- | --- |
-| `mode` | string | `single` 使用 `single_port`；`multiple` 使用 `port_start`～`port_end` 端口池。 |
+| `mode` | string | `single` 使用 `single_port`；`multiple` 使用 `port_start`～`port_end` 端口池；`pool` 从 `pool_file` 顺序读代理（支持账密 socks5，一窗口一代理）。 |
 | `type` | string | 代理协议，如 `http`、`socks5`。 |
 | `host` | string | 代理主机，如 `127.0.0.1`。**运行前请填写。** |
 | `single_port` | number | `mode=single` 时的端口。 |
@@ -165,7 +177,7 @@ OAuth 可处理：个人/工作帐户选择、保护帐户、验证电子邮件�
 
 - [LainsNL/OutlookRegister](https://github.com/LainsNL/OutlookRegister) — 本项目二开来源  
 - [Microsoft identity platform / Graph](https://learn.microsoft.com/en-us/graph/auth-v2-user) — OAuth2 与 Graph  
-- [patchright](https://github.com/Kaliiiiiiiiii-Vinyzu/patchright) — 浏览器自动化  
+- [DrissionPage](https://github.com/g1879/DrissionPage) — 浏览器自动化（驱动本机 Chrome）  
 
 ---
 

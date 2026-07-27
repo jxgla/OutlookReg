@@ -1,4 +1,4 @@
-"""微软辅助邮箱相关页面。
+"""微软辅助邮箱相关页面（DrissionPage 版）。
 
 A) 注册后绑定：「让我们来保护你的帐户」
    #EmailAddress → #iNext → #iOttText → #iNext
@@ -14,7 +14,10 @@ B) OAuth 冷登录验证已绑定邮箱（Fluent 新 UI）
 """
 import time
 
-from controllers.temp_mail import client_from_config
+from DrissionPage.common import Keys
+
+from controllers import dp_page as D
+from controllers.temp_mail import client_from_config, client_from_session
 
 # --- 绑定页 ---
 BACKUP_EMAIL_SELECTOR = "#EmailAddress"
@@ -36,20 +39,15 @@ KMSI_NO_BTN = 'button[data-testid="secondaryButton"]'
 def is_protect_account_page(page):
     """保护帐户 / 绑定备用邮箱页（#EmailAddress）。"""
     try:
-        if page.locator(BACKUP_EMAIL_SELECTOR).count() > 0:
-            try:
-                if page.locator(BACKUP_EMAIL_SELECTOR).first.is_visible():
-                    return True
-            except Exception:
+        if D.count(page, BACKUP_EMAIL_SELECTOR) > 0:
+            if D.vis(page, BACKUP_EMAIL_SELECTOR):
                 return True
+            return True
     except Exception:
         pass
-    try:
-        body = (page.locator("body").inner_text(timeout=600) or "")[:800]
-    except Exception:
-        body = ""
+    body = D.body_text(page, limit=800)
     if "保护你的帐户" in body or "保护您的帐户" in body or "protect your account" in body.lower():
-        if page.locator("#iShowSkip").count() > 0 or page.locator(NEXT_SELECTOR).count() > 0:
+        if D.count(page, "#iShowSkip") > 0 or D.count(page, NEXT_SELECTOR) > 0:
             return True
         if "备用" in body or "电子邮件" in body:
             return True
@@ -58,73 +56,49 @@ def is_protect_account_page(page):
 
 def is_ott_code_page(page):
     """旧绑定流单框验证码 #iOttText。"""
-    try:
-        loc = page.locator(VERIFY_CODE_SELECTOR)
-        return loc.count() > 0 and loc.first.is_visible()
-    except Exception:
-        return False
+    return D.vis(page, VERIFY_CODE_SELECTOR)
 
 
 def is_code_entry_page(page):
     """Fluent 6 格验证码页：「输入你的代码」#codeEntry-0..5。"""
-    try:
-        loc = page.locator(f"#{CODE_ENTRY_PREFIX}0")
-        if loc.count() > 0 and loc.first.is_visible():
+    if D.vis(page, f"#{CODE_ENTRY_PREFIX}0"):
+        return True
+    body = D.body_text(page, limit=400)
+    if "输入你的代码" in body or "Enter your code" in body:
+        if D.count(page, f"[id^='{CODE_ENTRY_PREFIX}']") >= 4:
             return True
-    except Exception:
-        pass
-    try:
-        body = (page.locator("body").inner_text(timeout=500) or "")[:400]
-        if "输入你的代码" in body or "Enter your code" in body:
-            if page.locator(f"[id^='{CODE_ENTRY_PREFIX}']").count() >= 4:
-                return True
-    except Exception:
-        pass
     return False
 
 
 def is_proof_confirm_page(page):
     """登录时「验证你的电子邮件」：确认已绑定辅助邮箱并发送验证码。"""
-    try:
-        loc = page.locator(PROOF_EMAIL_INPUT)
-        if loc.count() > 0 and loc.first.is_visible():
-            return True
-    except Exception:
-        pass
-    try:
-        if page.locator(PROOF_EMAIL_INPUT_BY_LABEL).count() > 0:
-            return True
-    except Exception:
-        pass
-    try:
-        body = (page.locator("body").inner_text(timeout=600) or "")[:900]
-    except Exception:
-        body = ""
+    if D.vis(page, PROOF_EMAIL_INPUT):
+        return True
+    if D.count(page, PROOF_EMAIL_INPUT_BY_LABEL) > 0:
+        return True
+    body = D.body_text(page, limit=900)
     if any(t in body for t in ("验证你的电子邮件", "验证您的电子邮件", "Verify your email")):
         if "发送验证码" in body or "Send code" in body or "已收到代码" in body:
             return True
         # 掩码辅助邮箱提示（不绑定具体域名）
-        if "or****" in body or "or*" in body or "@" in body and "发送" in body:
+        if "or****" in body or "or*" in body or ("@" in body and "发送" in body):
             return True
     return False
 
 
 def is_kmsi_page(page):
     """保持登录状态？→ 是 / 否（secondaryButton）。"""
-    try:
-        body = (page.locator("body").inner_text(timeout=500) or "")[:500]
-    except Exception:
-        body = ""
+    body = D.body_text(page, limit=500)
     if "保持登录" in body or "Stay signed in" in body or "保持登入" in body:
         return True
     try:
-        yes_btn = page.get_by_role("button", name="是")
-        no_btn = page.get_by_test_id("secondaryButton")
-        if yes_btn.count() > 0 and no_btn.count() > 0 and no_btn.first.is_visible():
+        yes_btn = D.role_button(page, "是")
+        no_btn = D.q(page, '[data-testid="secondaryButton"]')
+        if yes_btn and no_btn and D._displayed(no_btn):
             return True
         if (
-            page.get_by_role("button", name="是").count() > 0
-            and page.get_by_role("button", name="否").count() > 0
+            D.role_button(page, "是")
+            and D.role_button(page, "否")
             and ("登录" in body or "signed" in body.lower())
         ):
             return True
@@ -135,53 +109,33 @@ def is_kmsi_page(page):
 
 def _click_i_next(page):
     for sel in (NEXT_SELECTOR, 'input#iNext', 'input[type="submit"][value="下一步"]'):
-        try:
-            loc = page.locator(sel)
-            if loc.count() > 0 and loc.first.is_visible():
-                loc.first.click(timeout=5000)
+        if D.vis(page, sel):
+            if D.click_sel(page, sel, timeout=5):
                 return True
-        except Exception:
-            continue
-    try:
-        page.get_by_role("button", name="下一步").first.click(timeout=5000)
+    if D.click_role_button(page, "下一步", timeout=1):
         return True
-    except Exception:
-        return False
+    return False
 
 
 def _click_send_code(page):
     """点击「发送验证码」data-testid=primaryButton。"""
-    try:
-        btn = page.get_by_test_id("primaryButton")
-        if btn.count() > 0 and btn.first.is_visible():
-            btn.first.click(timeout=8000)
-            return True
-    except Exception:
-        pass
+    if D.click_if_visible(page, '[data-testid="primaryButton"]', timeout=8):
+        return True
     for text in ("发送验证码", "Send code", "Send verification code"):
-        try:
-            loc = page.get_by_role("button", name=text)
-            if loc.count() > 0 and loc.first.is_visible():
-                loc.first.click(timeout=8000)
-                return True
-        except Exception:
-            pass
+        if D.click_role_button(page, text, timeout=0):
+            return True
     return False
 
 
 def _fill_proof_email(page, address):
     """填入完整辅助邮箱到 proof-confirmation-email-input。"""
     for sel in (PROOF_EMAIL_INPUT, 'input[type="email"]', 'input[name*="proof"]', 'input[placeholder*="电子"]'):
+        el = D.q(page, sel)
+        if not el or not D._displayed(el):
+            continue
         try:
-            loc = page.locator(sel)
-            if loc.count() <= 0:
-                continue
-            box = loc.first
-            if not box.is_visible():
-                continue
-            box.click(timeout=3000)
-            box.fill("")
-            box.fill(address, timeout=8000)
+            el.click()
+            el.input(address, clear=True)
             return True
         except Exception:
             continue
@@ -195,16 +149,20 @@ def _fill_code_entry_digits(page, code):
         return False
 
     def _set_digit(box, ch):
-        box.click(timeout=2000)
+        box.click()
         try:
-            box.fill("")
+            box.clear()
         except Exception:
             pass
-        box.fill(ch, timeout=3000)
+        try:
+            box.input(ch, clear=True)
+        except Exception:
+            pass
         # Fluent/React 需 input 事件才会跳格并在满位时自动提交
         try:
-            box.evaluate(
-                """(el, v) => {
+            box.run_js(
+                """function(v){
+                    const el = this;
                     const proto = window.HTMLInputElement && window.HTMLInputElement.prototype;
                     const desc = proto && Object.getOwnPropertyDescriptor(proto, 'value');
                     if (desc && desc.set) { desc.set.call(el, v); }
@@ -217,29 +175,34 @@ def _fill_code_entry_digits(page, code):
         except Exception:
             pass
 
-    try:
-        first = page.locator(f"#{CODE_ENTRY_PREFIX}0").first
-        first.wait_for(state="visible", timeout=8000)
-        for i, ch in enumerate(code):
-            box = page.locator(f"#{CODE_ENTRY_PREFIX}{i}").first
-            box.wait_for(state="visible", timeout=5000)
-            _set_digit(box, ch)
-            page.wait_for_timeout(100)
-        page.wait_for_timeout(1500)
-        return True
-    except Exception:
+    first = page.ele(f"#{CODE_ENTRY_PREFIX}0", timeout=8)
+    if first:
         try:
-            first = page.locator(f"#{CODE_ENTRY_PREFIX}0").first
-            first.click(timeout=2000)
-            try:
-                first.fill("")
-            except Exception:
-                pass
-            first.type(code, delay=80, timeout=12000)
-            page.wait_for_timeout(1500)
+            for i, ch in enumerate(code):
+                box = page.ele(f"#{CODE_ENTRY_PREFIX}{i}", timeout=5)
+                if not box:
+                    raise RuntimeError('digit box missing')
+                _set_digit(box, ch)
+                page.wait(0.1)
+            page.wait(1.5)
             return True
         except Exception:
+            pass
+    # 兜底：整串输入到首格
+    try:
+        first = page.ele(f"#{CODE_ENTRY_PREFIX}0", timeout=2)
+        if not first:
             return False
+        first.click()
+        try:
+            first.clear()
+        except Exception:
+            pass
+        page.actions.click(first).type(code)
+        page.wait(1.5)
+        return True
+    except Exception:
+        return False
 
 
 def _click_kmsi_no(page, log=None):
@@ -248,56 +211,43 @@ def _click_kmsi_no(page, log=None):
         if log:
             log("kmsi", msg, level)
 
-    try:
-        btn = page.get_by_test_id("secondaryButton")
-        if btn.count() > 0 and btn.first.is_visible():
-            btn.first.click(timeout=5000)
-            _log("已点击 secondaryButton 否", "OK")
-            page.wait_for_timeout(1000)
-            return True
-    except Exception:
-        pass
-    for text in ("否", "No"):
+    btn = D.q(page, '[data-testid="secondaryButton"]')
+    if btn and D._displayed(btn):
         try:
-            loc = page.get_by_role("button", name=text)
-            if loc.count() > 0 and loc.first.is_visible():
-                loc.first.click(timeout=5000)
-                _log(f"已点击按钮 {text}", "OK")
-                page.wait_for_timeout(1000)
-                return True
+            btn.click()
+            _log("已点击 secondaryButton 否", "OK")
+            page.wait(1.0)
+            return True
         except Exception:
             pass
-    try:
-        loc = page.locator(KMSI_NO_BTN)
-        if loc.count() > 0 and loc.first.is_visible():
-            loc.first.click(timeout=5000)
-            _log("已点击 KMSI_NO_BTN", "OK")
-            page.wait_for_timeout(1000)
+    for text in ("否", "No"):
+        if D.click_role_button(page, text, timeout=0):
+            _log(f"已点击按钮 {text}", "OK")
+            page.wait(1.0)
             return True
-    except Exception:
-        pass
+    if D.click_if_visible(page, KMSI_NO_BTN):
+        _log("已点击 KMSI_NO_BTN", "OK")
+        page.wait(1.0)
+        return True
     return False
 
 
 def _skip_protect(page, log):
-    try:
-        skip = page.locator("#iShowSkip")
-        if skip.count() > 0 and skip.first.is_visible():
-            skip.first.click(timeout=4000)
+    if D.vis(page, "#iShowSkip"):
+        if D.click_sel(page, "#iShowSkip", timeout=4):
             if log:
                 log("recovery", "绑定失败后回退：已点 #iShowSkip 暂时跳过", "WARN")
-            page.wait_for_timeout(800)
+            page.wait(0.8)
             return True
-    except Exception:
-        pass
     return False
 
 
-def bind_recovery_email(page, temp_mail_cfg, log=None, code_timeout=120):
+def bind_recovery_email(page, temp_mail_cfg, log=None, code_timeout=120, local_name=None):
     """在保护帐户页绑定备用邮箱并输入验证码。
 
     成功返回 (True, session_dict)，session 含 address/jwt 供 OAuth 冷登录复用。
     失败返回 (False, None)。
+    local_name：可选，本地部分名；传当前 Outlook 邮箱名时，备用邮箱将尽量同名前缀、不同域名。
     """
     def _log(stage, msg, level="INFO"):
         if log:
@@ -308,7 +258,7 @@ def bind_recovery_email(page, temp_mail_cfg, log=None, code_timeout=120):
 
     if is_ott_code_page(page) and not is_protect_account_page(page):
         try:
-            if page.locator(BACKUP_EMAIL_SELECTOR).count() == 0:
+            if D.count(page, BACKUP_EMAIL_SELECTOR) == 0:
                 _log("recovery", "仅代码页且无邮箱框，跳过二次绑定", "WARN")
                 return True, None
         except Exception:
@@ -318,29 +268,23 @@ def bind_recovery_email(page, temp_mail_cfg, log=None, code_timeout=120):
 
     client = client_from_config(temp_mail_cfg or {})
     try:
-        addr, jwt = client.create_address()
+        addr, _token = client.create_address(name=(local_name or None))
     except Exception as exc:
         _log("recovery", f"创建临时邮箱失败: {exc}", "FAIL")
         _skip_protect(page, log)
         return False, None
 
-    session = {
-        "address": addr,
-        "jwt": jwt,
-        "base_url": client.base_url,
-        "admin_password": client.admin_password,
-        "domain": client.domain,
-    }
-    _log("recovery", f"临时邮箱已创建 addr={addr}（本任务独立 jwt）", "OK")
+    session = client.session_dict()
+    _log("recovery", f"临时邮箱已创建 addr={addr}（本任务独立会话，provider={session.get('provider')}）", "OK")
     after_ts = time.time()
 
     try:
-        email_box = page.locator(BACKUP_EMAIL_SELECTOR).first
-        email_box.wait_for(state="visible", timeout=10000)
-        email_box.click(timeout=3000)
-        email_box.fill("")
-        email_box.fill(addr, timeout=5000)
-        page.wait_for_timeout(300)
+        email_box = page.ele('css:' + BACKUP_EMAIL_SELECTOR, timeout=10)
+        if not email_box:
+            raise RuntimeError("备用邮箱框未出现")
+        email_box.click()
+        email_box.input(addr, clear=True)
+        page.wait(0.3)
         if not _click_i_next(page):
             raise RuntimeError("无法点击下一步提交备用邮箱")
         _log("recovery", f"已提交备用邮箱 {addr}", "INFO")
@@ -349,9 +293,7 @@ def bind_recovery_email(page, temp_mail_cfg, log=None, code_timeout=120):
         _skip_protect(page, log)
         return False, None
 
-    try:
-        page.locator(VERIFY_CODE_SELECTOR).first.wait_for(state="visible", timeout=30000)
-    except Exception:
+    if not page.ele('css:' + VERIFY_CODE_SELECTOR, timeout=30):
         if is_protect_account_page(page):
             _log("recovery", "提交后仍在保护帐户页", "WARN")
             _skip_protect(page, log)
@@ -360,7 +302,7 @@ def bind_recovery_email(page, temp_mail_cfg, log=None, code_timeout=120):
             _log("recovery", "未出现验证码输入框，视为可能已完成", "WARN")
             return True, session
 
-    page.wait_for_timeout(2000)
+    page.wait(2.0)
     code = client.wait_for_code(
         timeout_sec=int((temp_mail_cfg or {}).get("code_timeout", code_timeout)),
         poll_sec=float((temp_mail_cfg or {}).get("poll_interval", 3)),
@@ -370,23 +312,24 @@ def bind_recovery_email(page, temp_mail_cfg, log=None, code_timeout=120):
     if not code:
         _log("recovery", "未收到微软验证码，尝试暂时跳过", "FAIL")
         try:
-            page.go_back(timeout=5000)
-            page.wait_for_timeout(1000)
+            page.back()
+            page.wait(1.0)
             _skip_protect(page, log)
         except Exception:
             pass
         return False, None
 
     try:
-        ott = page.locator(VERIFY_CODE_SELECTOR).first
-        ott.click(timeout=3000)
-        ott.fill("")
-        ott.fill(code, timeout=5000)
-        page.wait_for_timeout(300)
+        ott = page.ele('css:' + VERIFY_CODE_SELECTOR, timeout=5)
+        if not ott:
+            raise RuntimeError("验证码框消失")
+        ott.click()
+        ott.input(code, clear=True)
+        page.wait(0.3)
         if not _click_i_next(page):
             raise RuntimeError("无法点击下一步提交验证码")
         _log("recovery", f"已提交验证码 code={code}", "OK")
-        page.wait_for_timeout(1500)
+        page.wait(1.5)
         return True, session
     except Exception as exc:
         _log("recovery", f"提交验证码失败: {exc}", "FAIL")
@@ -394,20 +337,8 @@ def bind_recovery_email(page, temp_mail_cfg, log=None, code_timeout=120):
 
 
 def _client_from_session(session, temp_mail_cfg):
-    """用绑定阶段保存的 jwt 重建 client，才能收同一邮箱的验证码。"""
-    if not session or not session.get("jwt"):
-        return None
-    cfg = dict(temp_mail_cfg or {})
-    if session.get("base_url"):
-        cfg["base_url"] = session["base_url"]
-    if session.get("admin_password"):
-        cfg["admin_password"] = session["admin_password"]
-    if session.get("domain"):
-        cfg["domain"] = session["domain"]
-    client = client_from_config(cfg)
-    client.address = session.get("address")
-    client.jwt = session.get("jwt")
-    return client
+    """用绑定阶段保存的会话重建 client（按 provider 分发），才能收同一邮箱的验证码。"""
+    return client_from_session(session, temp_mail_cfg or {})
 
 
 def verify_bound_email_on_login(page, bound_session, temp_mail_cfg, log=None, code_timeout=180):
@@ -446,7 +377,7 @@ def verify_bound_email_on_login(page, bound_session, temp_mail_cfg, log=None, co
             _log("proof_verify", f"无法填写辅助邮箱框 addr={bound_address}", "FAIL")
             return False
         _log("proof_verify", f"已填写辅助邮箱 {bound_address}", "INFO")
-        page.wait_for_timeout(300)
+        page.wait(0.3)
         after_ts = time.time()
         if not _click_send_code(page):
             _log("proof_verify", "无法点击「发送验证码」", "FAIL")
@@ -467,20 +398,18 @@ def verify_bound_email_on_login(page, bound_session, temp_mail_cfg, log=None, co
         # 「已收到代码」入口
         try:
             for text in ("已收到代码", "I have a code", "I already have a code"):
-                loc = page.get_by_text(text, exact=False)
-                if loc.count() > 0 and loc.first.is_visible():
-                    loc.first.click(timeout=4000)
-                    page.wait_for_timeout(800)
+                if D.click_if_visible(page, f'text:{text}', timeout=0):
+                    page.wait(0.8)
                     break
         except Exception:
             pass
-        page.wait_for_timeout(500)
+        page.wait(0.5)
 
     if not code_ready:
         _log("proof_verify", "未出现验证码输入页", "FAIL")
         return False
 
-    page.wait_for_timeout(1500)
+    page.wait(1.5)
     code = client.wait_for_code(
         timeout_sec=int((temp_mail_cfg or {}).get("code_timeout", code_timeout)),
         poll_sec=float((temp_mail_cfg or {}).get("poll_interval", 3)),
@@ -499,19 +428,20 @@ def verify_bound_email_on_login(page, bound_session, temp_mail_cfg, log=None, co
         _log("proof_verify", f"已填入 6 格验证码 code={code}（自动提交）", "OK")
     else:
         try:
-            ott = page.locator(VERIFY_CODE_SELECTOR).first
-            ott.click(timeout=3000)
-            ott.fill("")
-            ott.fill(code, timeout=5000)
+            ott = page.ele('css:' + VERIFY_CODE_SELECTOR, timeout=5)
+            if not ott:
+                raise RuntimeError("单框验证码框未出现")
+            ott.click()
+            ott.input(code, clear=True)
             if not _click_i_next(page):
-                page.keyboard.press("Enter")
+                page.actions.type(Keys.ENTER)
             _log("proof_verify", f"已提交单框验证码 code={code}", "OK")
         except Exception as exc:
             _log("proof_verify", f"单框填码失败: {exc}", "FAIL")
             return False
 
     # 等跳转 / KMSI
-    page.wait_for_timeout(2000)
+    page.wait(2.0)
     for _ in range(15):
         if is_kmsi_page(page):
             if _click_kmsi_no(page, log=log):
@@ -519,13 +449,13 @@ def verify_bound_email_on_login(page, bound_session, temp_mail_cfg, log=None, co
             break
         # 已到 consent / 其它页
         try:
-            if page.locator('[data-testid="appConsentPrimaryButton"]').count() > 0:
+            if D.count(page, '[data-testid="appConsentPrimaryButton"]') > 0:
                 break
             if "localhost" in (page.url or "") and "code=" in (page.url or ""):
                 break
         except Exception:
             pass
-        page.wait_for_timeout(400)
+        page.wait(0.4)
 
     # 再扫一次 KMSI（有时慢）
     if is_kmsi_page(page):
