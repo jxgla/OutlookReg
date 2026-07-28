@@ -96,6 +96,23 @@ PASSWORD_BYPASS_TEXTS = [
     "Use your password",
     "Sign in with a password",
 ]
+PASSKEY_ALT_METHOD_TEXTS = [
+    "换一种方式",
+    "尝试其他方式",
+    "其他方式",
+    "Try another way",
+    "Other ways to sign in",
+    "Sign-in options",
+]
+PASSKEY_LOGIN_HINT_TEXTS = [
+    "使用通行密钥登录",
+    "用通行密钥登录",
+    "passkey",
+    "Passkey",
+    "Windows Hello",
+    "安全密钥",
+    "security key",
+]
 PASSWORD_WRONG_TEXTS = [
     "此密码不是你的 Microsoft 帐户的正确密码",
     "This password is incorrect",
@@ -306,10 +323,93 @@ def _is_login_email_page_loose(page):
     return _text_exists(page, '下一步') or _text_exists(page, 'Next')
 
 
+def _is_passkey_login_prompt(page):
+    try:
+        url = page.url or ''
+    except Exception:
+        url = ''
+    body = ''
+    try:
+        body = D.body_text(page, limit=1000) or ''
+    except Exception:
+        pass
+    body_l = body.lower()
+    if 'fido' in url:
+        return True
+    for text in PASSKEY_LOGIN_HINT_TEXTS:
+        if any('一' <= c <= '鿿' for c in text):
+            if text in body:
+                return True
+        elif text.lower() in body_l:
+            return True
+    return False
+
+
+def _click_use_password(page):
+    for text in PASSWORD_BYPASS_TEXTS:
+        try:
+            if D.click_role_button(page, text, timeout=0):
+                page.wait(1.0)
+                return True
+        except Exception:
+            pass
+        try:
+            if D.click_if_visible(page, f'text:{text}'):
+                page.wait(1.0)
+                return True
+        except Exception:
+            pass
+        try:
+            if D.click_if_visible(page, f'input[type="button"][value="{text}"]'):
+                page.wait(1.0)
+                return True
+        except Exception:
+            pass
+    for sel in ('#iShowSkip', '#idA_PWD_SwitchToPassword', '#idA_PWD_SwitchToCredPicker'):
+        try:
+            if _vis(page, sel) and D.click_sel(page, sel, timeout=1.5):
+                page.wait(1.0)
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _dismiss_passkey_login_prompt(page, log=None):
+    if not _is_passkey_login_prompt(page):
+        return False
+    if log:
+        try:
+            log('passkey', '检测到通行密钥登录提示，尝试切到密码登录', 'WARN')
+        except Exception:
+            pass
+    # 失败页先点“使用另一种方式登录”，再切密码
+    try:
+        if D.click_if_visible(page, 'text:使用另一种方式登录') or D.click_role_button(page, '使用另一种方式登录', timeout=0):
+            page.wait(1.0)
+    except Exception:
+        pass
+    if _click_use_password(page):
+        if log:
+            try:
+                log('passkey', '已切换到密码登录', 'OK')
+            except Exception:
+                pass
+        return True
+    if _click_alt_signin_method(page) and _click_use_password(page):
+        if log:
+            try:
+                log('passkey', '已通过其他登录方式切到密码登录', 'OK')
+            except Exception:
+                pass
+        return True
+    return False
+
+
 def _current_auth_entry_state(page):
     """登录页状态机（可见 DOM 锚点，固定优先级）。
 
-    consent > account_type > protect_account > proof_verify > kmsi > login_email > login_password > unknown
+    consent > account_type > protect_account > proof_verify > kmsi > login_password > login_email > unknown
     """
     if _vis(page, CONSENT_SELECTOR):
         return 'consent'
@@ -321,10 +421,12 @@ def _current_auth_entry_state(page):
         return 'proof_verify'
     if _is_kmsi_only_page(page):
         return 'kmsi'
-    if _is_login_email_page_loose(page):
-        return 'login_email'
+    if _is_passkey_login_prompt(page):
+        return 'login_password'
     if _password_input(page) is not None:
         return 'login_password'
+    if _is_login_email_page_loose(page):
+        return 'login_email'
     return 'unknown'
 
 
@@ -343,13 +445,26 @@ def _handle_kmsi(page, log):
     return _current_auth_entry_state(page)
 
 
-def _handle_proof_verify(page, log, temp_mail_cfg=None, recovery_session=None, failure_hook=None):
-    """OAuth 冷登录：验证已绑定辅助邮箱（发码 → #codeEntry-0..5 自动提交 → KMSI 否）。"""
+def _handle_proof_verify(page, log, temp_mail_cfg=None, recovery_session=None, failure_hook=None, captured_code=None):
+    """OAuth 冷登录：优先尝试切到密码登录，否则再走已绑定辅助邮箱验证。"""
     # 仅 KMSI 时不需要 jwt
     if _is_kmsi_only_page(page):
         return _handle_kmsi(page, log)
 
     log('proof_verify', '检测到「验证电子邮件/输入代码」页', 'WARN')
+
+    # 很多 proof 页同时给了「使用密码」入口；优先回到密码流，避免卡在邮件验证页
+    if _click_use_password(page):
+        st = _wait_after_use_password(page, log=log, captured_code=captured_code, timeout_ms=15000)
+        if st == 'proof_verify':
+            # 仍在 proof 页面时，后续再按辅助邮箱验证兜底
+            log('proof_verify', f'点击使用密码后仍为 {st}，继续按辅助邮箱验证兜底', 'WARN')
+        elif st != 'unknown':
+            log('proof_verify', f'已从验证页切到 {st}', 'OK')
+            return st
+        else:
+            log('proof_verify', f'点击使用密码后状态={st}，继续按辅助邮箱验证兜底', 'WARN')
+
     session = recovery_session
     if not session or not session.get('address') or not session.get('jwt'):
         log('proof_verify', '无注册阶段保存的辅助邮箱 jwt，无法接码', 'FAIL')
@@ -438,7 +553,7 @@ def _handle_protect_account(page, log, temp_mail_cfg=None, failure_hook=None, al
     return st, session
 
 
-def _dump_auth_page(page, log, stage='auth_dump'):
+def _dump_auth_page(page, log, stage='auth_dump', observer=None):
     """失败时记录 URL + 正文摘要，便于对照截图。"""
     try:
         url = page.url or ''
@@ -451,6 +566,11 @@ def _dump_auth_page(page, log, stage='auth_dump'):
         body = ''
     state = _current_auth_entry_state(page)
     log(stage, f"state={state} url={url[:180]} body={body!r}", 'WARN')
+    if observer:
+        try:
+            observer(stage, page)
+        except Exception:
+            pass
     return state
 
 
@@ -508,7 +628,7 @@ def _click_personal_account(page, log=None):
     return clicked
 
 
-def _resolve_account_type(page, log, captured_code=None, max_rounds=3):
+def _resolve_account_type(page, log, captured_code=None, max_rounds=3, observer=None):
     """若在帐户类型页，点击个人帐户并返回新状态。"""
     state = _current_auth_entry_state(page)
     for _ in range(max_rounds):
@@ -516,7 +636,7 @@ def _resolve_account_type(page, log, captured_code=None, max_rounds=3):
             return state
         log('account_type', '检测到个人/工作帐户选择页，点击个人帐户', 'WARN')
         if not _click_personal_account(page, log):
-            _dump_auth_page(page, log, 'account_type_dump')
+            _dump_auth_page(page, log, 'account_type_dump', observer=observer)
             return 'account_type'
         try:
             _settle_auth_page(page, log, 'account_type')
@@ -593,7 +713,7 @@ def _submit_email_js_exact(page, full_email):
     D.click_sel(page, EMAIL_NEXT_SELECTOR, timeout=5)
 
 
-def _submit_email(page, full_email, log):
+def _submit_email(page, full_email, log, observer=None):
     if not D.q(page, EMAIL_SELECTOR, timeout=10):
         raise RuntimeError("邮箱框未出现")
     methods = [
@@ -602,7 +722,7 @@ def _submit_email(page, full_email, log):
         ("js_exact", _submit_email_js_exact),
         ("js_exact_retry", _submit_email_js_exact),
     ]
-    success_states = ('login_password', 'consent', 'code', 'account_type', 'protect_account')
+    success_states = ('login_password', 'consent', 'code', 'account_type', 'protect_account', 'proof_verify', 'kmsi')
     last_error = None
     last_stage = 'unknown'
     for name, method in methods:
@@ -611,13 +731,13 @@ def _submit_email(page, full_email, log):
             cur = _current_auth_entry_state(page)
             if cur in success_states:
                 if cur == 'account_type':
-                    cur = _resolve_account_type(page, log)
+                    cur = _resolve_account_type(page, log, observer=observer)
                 log('oauth_email', f"提交前已在阶段={cur}", 'OK')
                 return cur
             if D.count(page, EMAIL_SELECTOR) == 0:
                 cur = _current_auth_entry_state(page)
                 if cur == 'account_type':
-                    cur = _resolve_account_type(page, log)
+                    cur = _resolve_account_type(page, log, observer=observer)
                 return cur
             cur_el = D.q(page, EMAIL_SELECTOR)
             current = (cur_el.property('value') if cur_el else '') or ''
@@ -626,9 +746,9 @@ def _submit_email(page, full_email, log):
             stage = _wait_for_auth_entry_state(page, timeout_ms=12000)
             last_stage = stage
             if stage == 'account_type':
-                stage = _resolve_account_type(page, log)
+                stage = _resolve_account_type(page, log, observer=observer)
                 last_stage = stage
-            if stage in ('login_password', 'consent', 'code', 'protect_account'):
+            if stage in ('login_password', 'consent', 'code', 'protect_account', 'proof_verify', 'kmsi'):
                 log('oauth_email', f"{name} 成功进入阶段={stage}", 'OK')
                 return stage
             still_here = _vis(page, EMAIL_SELECTOR)
@@ -644,34 +764,106 @@ def _submit_email(page, full_email, log):
             # type 时常见：Next 点击超时但页面已导航到密码/帐户类型/同意页
             stage = _current_auth_entry_state(page)
             if stage == 'account_type':
-                stage = _resolve_account_type(page, log)
+                stage = _resolve_account_type(page, log, observer=observer)
             last_stage = stage
-            if stage in ('login_password', 'consent', 'code', 'protect_account'):
+            if stage in ('login_password', 'consent', 'code', 'protect_account', 'proof_verify', 'kmsi'):
                 log('oauth_email', f"{name} 异常后已在阶段={stage}", 'OK')
                 return stage
-    if last_stage in ('login_password', 'consent', 'code', 'account_type', 'protect_account'):
+    if last_stage in ('login_password', 'consent', 'code', 'account_type', 'protect_account', 'proof_verify', 'kmsi'):
         if last_stage == 'account_type':
-            last_stage = _resolve_account_type(page, log)
+            last_stage = _resolve_account_type(page, log, observer=observer)
         return last_stage
     if last_error:
         raise RuntimeError(f"邮箱提交失败: {_compact_exc(last_error)}")
     raise RuntimeError("邮箱提交后未进入密码页")
 
 
-def _click_use_password(page):
-    for text in PASSWORD_BYPASS_TEXTS:
+def _click_alt_signin_method(page):
+    for text in PASSKEY_ALT_METHOD_TEXTS:
         try:
             if D.click_role_button(page, text, timeout=0):
-                page.wait(1.5)
-                return
+                page.wait(1.2)
+                return True
         except Exception:
             pass
         try:
             if D.click_if_visible(page, f'text:{text}'):
-                page.wait(1.5)
-                return
+                page.wait(1.2)
+                return True
         except Exception:
             pass
+    for sel in ('#idA_PWD_SwitchToPassword', '#idA_PWD_SwitchToCredPicker', '#iShowSkip'):
+        try:
+            if _vis(page, sel) and D.click_sel(page, sel, timeout=1.5):
+                page.wait(1.2)
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _wait_after_use_password(page, log=None, captured_code=None, timeout_ms=12000):
+    state = _wait_for_auth_state_or_code(
+        page,
+        captured_code,
+        timeout_ms=timeout_ms,
+        ignore_states={'proof_verify'} if captured_code is not None else {'proof_verify'},
+    )
+    if state == 'login_email' and not _vis(page, EMAIL_SELECTOR):
+        state = _wait_for_real_login_entry(page, log=log, captured_code=captured_code, timeout_ms=6000)
+    if state == 'unknown':
+        state = _current_auth_entry_state(page)
+    if log:
+        try:
+            log('oauth_password', f'点击使用密码后等待状态={state}', 'INFO')
+        except Exception:
+            pass
+    return state
+
+
+def _wait_for_real_login_entry(page, log=None, captured_code=None, timeout_ms=12000):
+    """“使用密码”后若被宽松识别成 login_email，先等真实邮箱框/密码框落稳。"""
+    deadline = time.time() + timeout_ms / 1000.0
+    last_state = 'unknown'
+    while time.time() < deadline:
+        if captured_code and _wait_for_code_capture(page, captured_code, timeout_ms=0):
+            return 'code'
+        if _vis(page, EMAIL_SELECTOR):
+            return 'login_email'
+        if _password_input(page) is not None:
+            return 'login_password'
+        if _is_account_type_page(page):
+            return 'account_type'
+        if _is_protect_account_page(page):
+            return 'protect_account'
+        if _is_proof_verify_page(page):
+            return 'proof_verify'
+        if _is_kmsi_only_page(page):
+            return 'kmsi'
+        if _vis(page, CONSENT_SELECTOR):
+            return 'consent'
+        last_state = _current_auth_entry_state(page)
+        page.wait(0.4)
+    if _vis(page, EMAIL_SELECTOR):
+        return 'login_email'
+    if _password_input(page) is not None:
+        return 'login_password'
+    if _is_account_type_page(page):
+        return 'account_type'
+    if _is_protect_account_page(page):
+        return 'protect_account'
+    if _is_proof_verify_page(page):
+        return 'proof_verify'
+    if _is_kmsi_only_page(page):
+        return 'kmsi'
+    if _vis(page, CONSENT_SELECTOR):
+        return 'consent'
+    if log:
+        try:
+            log('login_entry', f'过渡页等待结束，最终仍未见真实邮箱框/密码框，last_state={last_state}', 'WARN')
+        except Exception:
+            pass
+    return 'unknown'
 
 
 def _describe_password_candidates(page):
@@ -715,6 +907,7 @@ def _password_locator(page, log, timeout_ms=15000):
     last_snapshot = ""
     while time.time() < deadline:
         _click_use_password(page)
+        _dismiss_passkey_login_prompt(page, log=log)
         for selector in ('#passwordEntry', '#i0118', 'input[type="password"]'):
             for idx, item in enumerate(D.q_all(page, selector)):
                 try:
@@ -801,63 +994,97 @@ def _has_unknown_account(page):
 
 
 def _dismiss_passkey_setup(page, log=None):
-    """密码后可能跳到「正在设置密钥」/ fido create，尝试取消回到同意流。"""
+    """检测并直接取消「创建/设置通行密钥」页，目标是不创建 passkey。"""
     try:
         url = page.url or ''
     except Exception:
         url = ''
-    body_hint = False
+    body = ''
     try:
-        body_hint = (
-            _text_exists(page, '正在设置密钥')
-            or _text_exists(page, '安全窗口')
-            or _text_exists(page, 'passkey')
-            or _text_exists(page, '通行密钥')
-            or 'fido/create' in url
-        )
+        body = D.body_text(page, limit=1400) or ''
     except Exception:
-        pass
-    if not body_hint and 'fido' not in url:
+        body = ''
+    passkey_hint = any(
+        k in body for k in (
+            '通行密钥', 'Windows Hello', 'passkey', 'Passkey',
+            '更快速地登录', 'face, fingerprint', 'security key',
+            '使用 Windows Hello', '创建通行密钥', '设置通行密钥',
+            'Save a passkey', 'Create a passkey', 'Set up a passkey',
+        )
+    ) or 'fido/create' in url or 'passkey' in url.lower()
+    if not passkey_hint and 'fido' not in url:
         return False
     if log:
-        log('passkey', f'检测到密钥设置页 url={url[:120]}', 'WARN')
-    # 优先点页面内「跳过」链（微软 passkey 页常见 id），这样连虚拟认证器都不必触发、不创建 passkey
-    for sel in ('#iCancel', '#iShowSkip', '#idBtn_Back'):
+        log('passkey', f'检测到密钥创建页 url={url[:120]}', 'WARN')
+
+    # 1) 优先点明确的取消/返回，不要点会继续创建的主按钮
+    try:
+        back = D.q(page, '#idBtn_Back')
+        if back and back.states.is_displayed:
+            value = ''
+            try:
+                value = ((back.attr('value') or '') + ' ' + (back.text or '')).strip()
+            except Exception:
+                value = ''
+            is_cancel = any(k in value for k in ('取消', 'Cancel', 'No', 'not now', 'Not now', '暂时不要'))
+            if is_cancel and D.click_sel(page, '#idBtn_Back', timeout=2.0):
+                page.wait(1.0)
+                if log:
+                    log('passkey', f'已点击 #idBtn_Back value={value[:40]!r}', 'OK')
+                return True
+    except Exception:
+        pass
+
+    for sel in ('#iCancel', '#iShowSkip'):
         try:
             if _vis(page, sel) and D.click_sel(page, sel, timeout=2.0):
-                page.wait(1)
+                page.wait(1.0)
                 if log:
                     log('passkey', f'已点击跳过 {sel}', 'OK')
                 return True
         except Exception:
             pass
-    for text in ('暂时跳过', '现在跳过', '跳过', '以后再说', '取消', 'Skip for now',
-                 'Maybe later', 'Not now', 'Cancel', 'Skip'):
+
+    # 2) 文本兜底：只点取消/跳过类，不碰“重试/继续/下一步/设置”
+    for text in ('取消', 'Cancel', '暂时不要', 'Not now', 'Skip for now', 'Maybe later', '以后再说', '暂时跳过', '现在跳过', '跳过', 'Skip'):
         try:
             if D.click_role_button(page, text, timeout=0):
-                page.wait(1)
+                page.wait(1.0)
                 if log:
                     log('passkey', f'已点击 {text}', 'OK')
                 return True
         except Exception:
             pass
         try:
-            if D.click_if_visible(page, f'input[type="button"][value="{text}"]'):
-                page.wait(1)
+            if D.click_if_visible(page, f'text:{text}'):
+                page.wait(1.0)
                 if log:
-                    log('passkey', f'已点击 input {text}', 'OK')
+                    log('passkey', f'已点击 text:{text}', 'OK')
                 return True
         except Exception:
             pass
-    # 最后：若仍在 fido 页，直接跳回我们的 authorize（依赖 cookie）
-    try:
-        page.get(build_auth_url(login_hint=full_email))
-        page.wait(1.2)
-        if log:
-            log('passkey', '密钥页无法取消，已回跳 authorize', 'WARN')
-        return True
-    except Exception:
-        return False
+        try:
+            if D.click_if_visible(page, f'input[type="button"][value="{text}"]'):
+                page.wait(1.0)
+                if log:
+                    log('passkey', f'已点击 input:{text}', 'OK')
+                return True
+        except Exception:
+            pass
+
+    # 3) 若已经落到失败页，点“后退”优先回上一层，再由状态机继续，不再 goto authorize
+    if '尝试使用密钥登录时出错' in body or 'We couldn\'t sign you in' in body:
+        for text in ('后退', 'Back', '返回'):
+            try:
+                if D.click_role_button(page, text, timeout=0) or D.click_if_visible(page, f'text:{text}'):
+                    page.wait(1.0)
+                    if log:
+                        log('passkey', f'已从密钥失败页返回: {text}', 'WARN')
+                    return True
+            except Exception:
+                pass
+
+    return False
 
 
 def _run_cookie_recovery(page, auth_url, log, entry_timeout_ms=AUTH_ENTRY_TIMEOUT_MS):
@@ -895,13 +1122,13 @@ def _run_cookie_recovery(page, auth_url, log, entry_timeout_ms=AUTH_ENTRY_TIMEOU
 def _digest_post_email_states(
     page, log, state, captured_code=None, temp_mail_cfg=None,
     recovery_already_bound=False, recovery_session=None, failure_hook=None, rounds=4,
-    current_email_local='',
+    current_email_local='', observer=None,
 ):
     """邮箱提交后可能出现的中间页：帐户类型 / 绑定保护 / 验证辅助邮箱 / 密钥 / KMSI。"""
     session = recovery_session
     for _ in range(rounds):
         if state == 'account_type':
-            state = _resolve_account_type(page, log, captured_code=captured_code)
+            state = _resolve_account_type(page, log, captured_code=captured_code, observer=observer)
             log('account_type', f'处理后状态={state}', 'INFO')
             continue
         if state == 'protect_account':
@@ -917,7 +1144,7 @@ def _digest_post_email_states(
         if state == 'proof_verify':
             state = _handle_proof_verify(
                 page, log, temp_mail_cfg=temp_mail_cfg,
-                recovery_session=session, failure_hook=failure_hook,
+                recovery_session=session, failure_hook=failure_hook, captured_code=captured_code,
             )
             log('proof_verify', f'处理后状态={state}', 'INFO')
             continue
@@ -926,6 +1153,9 @@ def _digest_post_email_states(
             log('kmsi', f'处理后状态={state}', 'INFO')
             continue
         if state == 'unknown':
+            if _dismiss_passkey_login_prompt(page, log=log):
+                state = _wait_for_auth_state_or_code(page, captured_code, timeout_ms=12000)
+                continue
             if _dismiss_passkey_setup(page, log):
                 state = _wait_for_auth_state_or_code(page, captured_code, timeout_ms=12000)
                 continue
@@ -945,21 +1175,30 @@ def _digest_post_email_states(
 def _perform_login_after_cookie_fail(
     page, full_email, password, log, failure_hook=None, state='login_email',
     captured_code=None, temp_mail_cfg=None, recovery_already_bound=False, recovery_session=None,
+    observer=None,
 ):
     current_email_local = (str(full_email or '').split('@', 1)[0]).strip()
     state, recovery_session = _digest_post_email_states(
         page, log, state, captured_code=captured_code, temp_mail_cfg=temp_mail_cfg,
         recovery_already_bound=recovery_already_bound, recovery_session=recovery_session,
         failure_hook=failure_hook, rounds=4, current_email_local=current_email_local,
+        observer=observer,
     )
 
     if state == 'login_email':
         log('login_email', '开始输入邮箱', 'WARN')
         try:
-            email_stage = _submit_email(page, full_email, log)
+            email_stage = _submit_email(page, full_email, log, observer=observer)
         except Exception as exc:
             log('login_email', f'邮箱提交异常: {_compact_exc(exc)}', 'WARN')
-            email_stage = _current_auth_entry_state(page)
+            state = _current_auth_entry_state(page)
+            state, recovery_session = _digest_post_email_states(
+                page, log, state, captured_code=captured_code, temp_mail_cfg=temp_mail_cfg,
+                recovery_already_bound=recovery_already_bound, recovery_session=recovery_session,
+                failure_hook=failure_hook, rounds=4, current_email_local=current_email_local,
+                observer=observer,
+            )
+            email_stage = state
         if email_stage in (
             'login_password', 'consent', 'code', 'account_type',
             'protect_account', 'proof_verify', 'kmsi',
@@ -973,30 +1212,43 @@ def _perform_login_after_cookie_fail(
             page, log, state, captured_code=captured_code, temp_mail_cfg=temp_mail_cfg,
             recovery_already_bound=recovery_already_bound, recovery_session=recovery_session,
             failure_hook=failure_hook, rounds=4, current_email_local=current_email_local,
+            observer=observer,
         )
         log('login_email', f'邮箱提交后状态={state}', 'INFO')
         if _has_unknown_account(page):
-            _dump_auth_page(page, log)
+            _dump_auth_page(page, log, observer=observer)
             log('login_email', '邮箱不存在', 'FAIL')
             return False, recovery_session
         if state == 'login_email':
             if failure_hook:
                 failure_hook('oauth_login_timeout')
-            _dump_auth_page(page, log)
+            _dump_auth_page(page, log, observer=observer)
             log('login_email', '邮箱页停留超时', 'FAIL')
             return False, recovery_session
 
     state, recovery_session = _digest_post_email_states(
         page, log, state, captured_code=captured_code, temp_mail_cfg=temp_mail_cfg,
         recovery_already_bound=recovery_already_bound, recovery_session=recovery_session,
-        failure_hook=failure_hook, rounds=3,
+        failure_hook=failure_hook, rounds=3, observer=observer,
     )
 
     if state == 'login_password':
         if _has_password_login_blocked(page):
+            if _dismiss_passkey_login_prompt(page, log=log):
+                state = _wait_for_auth_state_or_code(
+                    page, captured_code, timeout_ms=AUTH_ENTRY_TIMEOUT_MS, ignore_states={'login_password'}
+                )
+                state, recovery_session = _digest_post_email_states(
+                    page, log, state, captured_code=captured_code, temp_mail_cfg=temp_mail_cfg,
+                    recovery_already_bound=recovery_already_bound, recovery_session=recovery_session,
+                    failure_hook=failure_hook, rounds=2, current_email_local=current_email_local,
+                    observer=observer,
+                )
+            if state in ('consent', 'code'):
+                return True, recovery_session
             if failure_hook:
                 failure_hook('oauth_password_blocked')
-            _dump_auth_page(page, log)
+            _dump_auth_page(page, log, observer=observer)
             log('login_password', '密码登录不可用，跳过硬填', 'FAIL')
             return False, recovery_session
         log('login_password', '开始输入密码', 'WARN')
@@ -1004,13 +1256,13 @@ def _perform_login_after_cookie_fail(
         if _has_password_login_blocked(page):
             if failure_hook:
                 failure_hook('oauth_password_blocked')
-            _dump_auth_page(page, log)
+            _dump_auth_page(page, log, observer=observer)
             log('login_password', '检测到密码登录不可用', 'FAIL')
             return False, recovery_session
         if _has_invalid_password(page):
             if failure_hook:
                 failure_hook('oauth_password_wrong')
-            _dump_auth_page(page, log)
+            _dump_auth_page(page, log, observer=observer)
             log('login_password', '检测到密码错误提示', 'FAIL')
             return False, recovery_session
         state = _wait_for_auth_state_or_code(
@@ -1020,6 +1272,7 @@ def _perform_login_after_cookie_fail(
             page, log, state, captured_code=captured_code, temp_mail_cfg=temp_mail_cfg,
             recovery_already_bound=recovery_already_bound, recovery_session=recovery_session,
             failure_hook=failure_hook, rounds=4, current_email_local=current_email_local,
+            observer=observer,
         )
         log('login_password', f'密码提交后状态={state}', 'INFO')
         if state == 'code':
@@ -1028,17 +1281,17 @@ def _perform_login_after_cookie_fail(
             if _has_password_login_blocked(page):
                 if failure_hook:
                     failure_hook('oauth_password_blocked')
-                _dump_auth_page(page, log)
+                _dump_auth_page(page, log, observer=observer)
                 log('login_password', '密码提交后：密码登录不可用', 'FAIL')
             elif _has_invalid_password(page):
                 if failure_hook:
                     failure_hook('oauth_password_wrong')
-                _dump_auth_page(page, log)
+                _dump_auth_page(page, log, observer=observer)
                 log('login_password', '检测到密码错误提示', 'FAIL')
             else:
                 if failure_hook:
                     failure_hook('oauth_consent_fail')
-                _dump_auth_page(page, log)
+                _dump_auth_page(page, log, observer=observer)
                 log('login_password', f'未进入同意页面 final_state={state}', 'FAIL')
             return False, recovery_session
 
@@ -1047,6 +1300,7 @@ def _perform_login_after_cookie_fail(
             page, log, state, captured_code=captured_code, temp_mail_cfg=temp_mail_cfg,
             recovery_already_bound=recovery_already_bound, recovery_session=recovery_session,
             failure_hook=failure_hook, rounds=4, current_email_local=current_email_local,
+            observer=observer,
         )
         log('proof_verify', f'proof/kmsi 处理后状态={state}', 'INFO')
         if state == 'login_password':
@@ -1059,7 +1313,7 @@ def _perform_login_after_cookie_fail(
                 state, recovery_session = _digest_post_email_states(
                     page, log, state, captured_code=captured_code, temp_mail_cfg=temp_mail_cfg,
                     recovery_already_bound=recovery_already_bound, recovery_session=recovery_session,
-                    failure_hook=failure_hook, rounds=3,
+                    failure_hook=failure_hook, rounds=3, observer=observer,
                 )
         if state == 'code':
             return True, recovery_session
@@ -1068,7 +1322,7 @@ def _perform_login_after_cookie_fail(
         if state not in ('consent', 'code'):
             if failure_hook:
                 failure_hook('oauth_consent_fail')
-            _dump_auth_page(page, log)
+            _dump_auth_page(page, log, observer=observer)
             log('proof_verify', f'验证后未进入同意页 final_state={state}', 'FAIL')
             return False, recovery_session
 
@@ -1197,7 +1451,7 @@ def _exchange_captured_code(page, captured_code, log, failure_hook=None, current
     )
 
 
-def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', backup_proxy=None, failure_hook=None, log_hook=None, current_proxy="", token_proxy_getter=None, temp_mail_cfg=None, recovery_already_bound=False, recovery_session=None):
+def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', backup_proxy=None, failure_hook=None, log_hook=None, observer=None, current_proxy="", token_proxy_getter=None, temp_mail_cfg=None, recovery_already_bound=False, recovery_session=None):
     auth_url = build_auth_url(login_hint=full_email)
     current_email_local = (str(full_email or '').split('@', 1)[0]).strip()
 
@@ -1209,6 +1463,8 @@ def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', ba
         print(f"{tag}[{level}] {time.strftime('%H:%M:%S')} | {stage} | {message}")
 
     def _try_flow():
+        flow_recovery_already_bound = bool(recovery_already_bound)
+        flow_recovery_session = recovery_session
         _log('start', '开始 OAuth2（同浏览器 context，强制交互登录）')
         # 同一 BrowserContext 新开 tab，共享注册后的 login.live.com cookie
         pg = page.browser.new_tab()
@@ -1229,21 +1485,22 @@ def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', ba
             _log('entry', f'首次检测状态={state}')
 
             if state == 'account_type':
-                state = _resolve_account_type(pg, _log, captured_code=captured_code)
+                state = _resolve_account_type(pg, _log, captured_code=captured_code, observer=observer)
                 _log('entry', f'帐户类型处理后状态={state}')
             if state == 'protect_account':
                 state, new_recovery_session = _handle_protect_account(
                     pg, _log, temp_mail_cfg=temp_mail_cfg, failure_hook=failure_hook,
-                    already_bound=recovery_already_bound, current_email_local=current_email_local,
+                    already_bound=flow_recovery_already_bound, current_email_local=current_email_local,
                 )
                 if new_recovery_session:
-                    recovery_session = new_recovery_session
-                    recovery_already_bound = True
+                    flow_recovery_session = new_recovery_session
+                    flow_recovery_already_bound = True
                 _log('entry', f'保护帐户处理后状态={state}')
             if state == 'proof_verify':
                 state = _handle_proof_verify(
                     pg, _log, temp_mail_cfg=temp_mail_cfg,
-                    recovery_session=recovery_session, failure_hook=failure_hook,
+                    recovery_session=flow_recovery_session, failure_hook=failure_hook,
+                    captured_code=captured_code,
                 )
                 _log('entry', f'proof 验证后状态={state}')
             if state == 'kmsi':
@@ -1254,21 +1511,21 @@ def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', ba
             if state == 'login_email':
                 _log('entry', '仍需邮箱：跳过连环 recovery，同页直接补登（保留 cookie）', 'WARN')
             elif state == 'unknown':
-                _dump_auth_page(pg, _log, 'entry_unknown')
+                _dump_auth_page(pg, _log, 'entry_unknown', observer=observer)
                 if _is_account_type_page(pg):
-                    state = _resolve_account_type(pg, _log, captured_code=captured_code)
+                    state = _resolve_account_type(pg, _log, captured_code=captured_code, observer=observer)
                 elif _is_protect_account_page(pg):
                     state, new_recovery_session = _handle_protect_account(
                         pg, _log, temp_mail_cfg=temp_mail_cfg, failure_hook=failure_hook,
-                        already_bound=recovery_already_bound, current_email_local=current_email_local,
+                        already_bound=flow_recovery_already_bound, current_email_local=current_email_local,
                     )
                     if new_recovery_session:
-                        recovery_session = new_recovery_session
-                        recovery_already_bound = True
+                        flow_recovery_session = new_recovery_session
+                        flow_recovery_already_bound = True
                 elif _is_proof_verify_page(pg):
                     state = _handle_proof_verify(
                         pg, _log, temp_mail_cfg=temp_mail_cfg,
-                        recovery_session=recovery_session, failure_hook=failure_hook,
+                        recovery_session=flow_recovery_session, failure_hook=failure_hook,
                     )
                 elif _is_kmsi_only_page(pg):
                     state = _handle_kmsi(pg, _log)
@@ -1289,25 +1546,26 @@ def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', ba
                 _log('entry', f'处理后状态={state}')
 
             if state == 'account_type':
-                state = _resolve_account_type(pg, _log, captured_code=captured_code)
+                state = _resolve_account_type(pg, _log, captured_code=captured_code, observer=observer)
             if state == 'protect_account':
                 state, new_recovery_session = _handle_protect_account(
                     pg, _log, temp_mail_cfg=temp_mail_cfg, failure_hook=failure_hook,
-                    already_bound=recovery_already_bound, current_email_local=current_email_local,
+                    already_bound=flow_recovery_already_bound, current_email_local=current_email_local,
                 )
                 if new_recovery_session:
-                    recovery_session = new_recovery_session
-                    recovery_already_bound = True
+                    flow_recovery_session = new_recovery_session
+                    flow_recovery_already_bound = True
             if state == 'proof_verify':
                 state = _handle_proof_verify(
                     pg, _log, temp_mail_cfg=temp_mail_cfg,
-                    recovery_session=recovery_session, failure_hook=failure_hook,
+                    recovery_session=flow_recovery_session, failure_hook=failure_hook,
+                    captured_code=captured_code,
                 )
             if state == 'kmsi':
                 state = _handle_kmsi(pg, _log)
 
             if state in ('login_email', 'login_password', 'account_type', 'protect_account', 'proof_verify', 'kmsi'):
-                ok, recovery_session = _perform_login_after_cookie_fail(
+                ok, flow_recovery_session = _perform_login_after_cookie_fail(
                     pg,
                     full_email,
                     password,
@@ -1316,16 +1574,15 @@ def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', ba
                     state=state,
                     captured_code=captured_code,
                     temp_mail_cfg=temp_mail_cfg,
-                    recovery_already_bound=recovery_already_bound,
-                    recovery_session=recovery_session,
+                    observer=observer,
                 )
                 if not ok:
-                    return False, None, recovery_session
+                    return False, None, flow_recovery_session
                 state = _wait_for_auth_state_or_code(pg, captured_code, timeout_ms=8000)
-                state, recovery_session = _digest_post_email_states(
+                state, flow_recovery_session = _digest_post_email_states(
                     pg, _log, state, captured_code=captured_code, temp_mail_cfg=temp_mail_cfg,
-                    recovery_already_bound=recovery_already_bound, recovery_session=recovery_session,
-                    failure_hook=failure_hook, rounds=3,
+                    recovery_already_bound=flow_recovery_already_bound, recovery_session=flow_recovery_session,
+                    failure_hook=failure_hook, rounds=3, observer=observer,
                 )
                 _log('entry', f'登录后阶段={state}', 'INFO')
 
@@ -1338,7 +1595,7 @@ def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', ba
                     current_proxy=current_proxy,
                     token_proxy_getter=token_proxy_getter,
                 )
-                return ok, token, recovery_session
+                return ok, token, flow_recovery_session
             if state == 'consent':
                 ok, token = _click_consent_and_exchange(
                     pg,
@@ -1348,16 +1605,16 @@ def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', ba
                     current_proxy=current_proxy,
                     token_proxy_getter=token_proxy_getter,
                 )
-                return ok, token, recovery_session
+                return ok, token, flow_recovery_session
 
             if failure_hook:
                 failure_hook('oauth_consent_fail')
-            _dump_auth_page(pg, _log)
+            _dump_auth_page(pg, _log, observer=observer)
             _log('entry', f'未进入同意或登录页面，最终状态={state}', 'FAIL')
-            return False, None, recovery_session
+            return False, None, flow_recovery_session
         except Exception as e:
             _log('exception', f'异常: {_compact_exc(e)}', 'FAIL')
-            return False, None, recovery_session
+            return False, None, flow_recovery_session
         finally:
             try:
                 pg.listen.stop()

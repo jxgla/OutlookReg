@@ -231,9 +231,12 @@ def prepare_tab(tab, timezone=None, locale=None, loc=None, load_mode='normal'):
 
     load_mode 默认 normal：eager 会导致嵌套 iframe 子文档元素查询失败
     （验证码 frame2 内元素定位不到）。
+
+    注意：这里不再默认安装 WebAuthn 虚拟认证器。
+    否则 passkey create/get 可能被静默完成，等于“真创建了通行密钥”，
+    后续登录会被微软继续引到 passkey 路径，而不是我们要的“完全跳过创建”。
     """
     inject_stealth(tab)
-    enable_webauthn_autoskip(tab)
     apply_emulation(tab, timezone=timezone, locale=locale, loc=loc)
     try:
         if load_mode == 'eager':

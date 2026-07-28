@@ -61,10 +61,10 @@ python main.py
 Successful tokens are **appended** to `Results/oauth2.txt`:
 
 ```text
-email----password----client_id----refresh_token
+email----password----client_id----refresh_token----aux_email
 ```
 
-Logs are written under `log/`. Press **Ctrl+C** to stop; the process writes a summary, then cleans browsers/profiles.
+Logs are written under `log/`. OAuth failures also save page screenshots under `log/oauth_debug/` for later comparison. Press **Ctrl+C** to stop; the process writes a summary, then cleans browsers/profiles.
 
 ---
 
@@ -87,7 +87,7 @@ Ship template: `config.example.json` (same shape as the empty `config.json`). Bo
 | `success_tasks` | number \| null | Global success cap. `null` = no success cap (still limited by `tasks`). |
 | `batch_success_limit` | number | Successes per batch before resetting in-process proxy weights / stats and starting the next batch. Cumulative success/time keep counting. Does **not** change a fixed proxy’s real exit IP. |
 | `proxy` | object | Proxy pool (required for real use). |
-| `oauth2` | object | Graph OAuth2 settings. |
+| `oauth2` | object | Graph/Outlook OAuth2 settings. |
 | `temp_mail` | object | Optional recovery-email binding via temp-mail API. |
 
 ### `captcha_strategy`
@@ -117,7 +117,9 @@ Ship template: `config.example.json` (same shape as the empty `config.json`). Bo
 | `enable_oauth2` | bool | If `false`, registration success alone counts without fetching tokens. |
 | `client_id` | string | Azure/public client id used for authorize + token exchange. |
 | `redirect_url` | string | Redirect URI registered for the client (default `http://localhost`). |
-| `Scopes` | string[] | OAuth scopes, typically `offline_access` + Graph default. |
+| `tenant` | string | Tenant segment for Microsoft identity (`common` for personal + org accounts). |
+| `Scopes` | string[] | Full authorize scopes used on the interactive OAuth page. |
+| `rt_scope` | string | Scope family used when exchanging the localhost callback code for the saved refresh token: `graph` or `imap`. |
 
 ### `temp_mail`
 

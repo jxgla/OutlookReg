@@ -121,7 +121,7 @@ def _aux_email_of(controller):
         return ''
 
 
-def _login_and_get_token(page, email, password, prefix='', failure_hook=None, log_hook=None, current_proxy='', token_proxy_getter=None, temp_mail_cfg=None, recovery_already_bound=False, recovery_session=None):
+def _login_and_get_token(page, email, password, prefix='', failure_hook=None, log_hook=None, observer=None, current_proxy='', token_proxy_getter=None, temp_mail_cfg=None, recovery_already_bound=False, recovery_session=None):
     """
     OAuth2 Step 2: 在新浏览器(新IP)中完成完整登录 + 授权。
 
@@ -156,7 +156,7 @@ def _login_and_get_token(page, email, password, prefix='', failure_hook=None, lo
         _log('entry', f'首次检测状态={state}')
 
         if state == 'account_type':
-            state = _resolve_account_type(page, _log, captured_code=captured_code)
+            state = _resolve_account_type(page, _log, captured_code=captured_code, observer=observer)
             _log('entry', f'帐户类型处理后状态={state}')
         if state == 'protect_account':
             state, new_recovery_session = _handle_protect_account(
@@ -170,7 +170,7 @@ def _login_and_get_token(page, email, password, prefix='', failure_hook=None, lo
         if state == 'proof_verify':
             state = _handle_proof_verify(
                 page, _log, temp_mail_cfg=temp_mail_cfg,
-                recovery_session=recovery_session, failure_hook=failure_hook,
+                recovery_session=recovery_session, failure_hook=failure_hook, captured_code=captured_code,
             )
             _log('entry', f'proof 验证后状态={state}')
         if state == 'kmsi':
@@ -193,6 +193,7 @@ def _login_and_get_token(page, email, password, prefix='', failure_hook=None, lo
                 temp_mail_cfg=temp_mail_cfg,
                 recovery_already_bound=recovery_already_bound,
                 recovery_session=recovery_session,
+                observer=observer,
             )
             if not ok:
                 return False, None, recovery_session
@@ -212,7 +213,7 @@ def _login_and_get_token(page, email, password, prefix='', failure_hook=None, lo
             # 登录后可能刚到 consent / 又弹出帐户类型 / 保护帐户 / proof
             state = _wait_for_auth_entry_state(page, timeout_ms=8000)
             if state == 'account_type':
-                state = _resolve_account_type(page, _log, captured_code=captured_code)
+                state = _resolve_account_type(page, _log, captured_code=captured_code, observer=observer)
             if state == 'protect_account':
                 state, new_recovery_session = _handle_protect_account(
                     page, _log, temp_mail_cfg=temp_mail_cfg, failure_hook=failure_hook,
@@ -224,7 +225,7 @@ def _login_and_get_token(page, email, password, prefix='', failure_hook=None, lo
             if state == 'proof_verify':
                 state = _handle_proof_verify(
                     page, _log, temp_mail_cfg=temp_mail_cfg,
-                    recovery_session=recovery_session, failure_hook=failure_hook,
+                    recovery_session=recovery_session, failure_hook=failure_hook, captured_code=captured_code,
                 )
             if state == 'kmsi':
                 state = _handle_kmsi(page, _log)
@@ -260,7 +261,7 @@ def _login_and_get_token(page, email, password, prefix='', failure_hook=None, lo
 
         if failure_hook:
             failure_hook('oauth_consent_fail')
-        _dump_auth_page(page, _log)
+        _dump_auth_page(page, _log, observer=observer)
         _log('entry', f'未进入同意或登录页面，最终状态={state}', 'FAIL')
         return False, None, recovery_session
 
@@ -383,6 +384,7 @@ def process_single_flow(controller, task_num=0, total=0):
             RESULTS_DIR,
             failure_hook=controller.bump_failure,
             log_hook=controller.make_logger('OAUTH_COOKIE', attempt=1),
+            observer=controller.make_oauth_observer('OAUTH_COOKIE', attempt=1),
             current_proxy=current_proxy,
             token_proxy_getter=lambda exclude='': controller.fresh_proxy_url(exclude=exclude),
             temp_mail_cfg=getattr(controller, 'temp_mail_cfg', None),
@@ -413,6 +415,7 @@ def process_single_flow(controller, task_num=0, total=0):
             RESULTS_DIR,
             failure_hook=controller.bump_failure,
             log_hook=controller.make_logger('OAUTH_COOKIE', attempt=2),
+            observer=controller.make_oauth_observer('OAUTH_COOKIE', attempt=2),
             current_proxy=current_proxy,
             token_proxy_getter=lambda exclude='': controller.fresh_proxy_url(exclude=exclude),
             temp_mail_cfg=getattr(controller, 'temp_mail_cfg', None),
@@ -478,6 +481,7 @@ def process_single_flow(controller, task_num=0, total=0):
                     prefix=controller._log_prefix_str(),
                     failure_hook=controller.bump_failure,
                     log_hook=controller.make_logger('OAUTH_NEW', attempt=attempt),
+                    observer=controller.make_oauth_observer('OAUTH_NEW', attempt=attempt),
                     current_proxy=controller.current_requests_proxy(),
                     token_proxy_getter=lambda exclude='': controller.fresh_proxy_url(exclude=exclude),
                     temp_mail_cfg=getattr(controller, 'temp_mail_cfg', None),

@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import time
 import random
@@ -99,6 +100,8 @@ class OutlookController:
             self.log_dir,
             f"{time.strftime('%Y-%m-%d_%H-%M-%S')}_{os.getpid()}.txt"
         )
+        self.oauth_debug_dir = os.path.join(self.log_dir, 'oauth_debug')
+        os.makedirs(self.oauth_debug_dir, exist_ok=True)
         self.log_plain("[Browser] mode=drissionpage (system Chrome) stealth=screenX+force")
         self.runtime_stats = {
             'started_at': time.time(),
@@ -246,10 +249,36 @@ class OutlookController:
             if len(text) > 400:
                 text = text[:397] + '...'
         with self.log_lock:
-            print(text, flush=True)
+            try:
+                print(text, flush=True)
+            except UnicodeEncodeError:
+                enc = getattr(sys.stdout, 'encoding', None) or 'utf-8'
+                safe = text.encode(enc, errors='replace').decode(enc, errors='replace')
+                print(safe, flush=True)
             with open(self.log_path, 'a', encoding='utf-8') as f:
                 f.write(text + '\n')
                 f.flush()
+
+    def capture_oauth_debug(self, page, stage, flow='OAUTH'):
+        """故障时抓 OAuth 页面可视截图，供后续比对页面变体。"""
+        if not page:
+            return ''
+        prefix = getattr(self.thread_local, '_log_prefix', '').strip('[]').replace(':', '-').replace('/', '_') or 'no-prefix'
+        stamp = time.strftime('%Y-%m-%d_%H-%M-%S')
+        name = f"{stamp}_{flow}_{stage}_{prefix}.png"
+        shot = os.path.join(self.oauth_debug_dir, name)
+        try:
+            page.get_screenshot(path=self.oauth_debug_dir, name=name)
+            return shot
+        except Exception:
+            return ''
+
+    def make_oauth_observer(self, flow, attempt=None):
+        def _observer(stage, page=None):
+            shot = self.capture_oauth_debug(page, stage, flow=flow)
+            if shot:
+                self.log_event(flow, 'WARN', stage, f'已保存故障截图 {shot}', attempt=attempt)
+        return _observer
 
     def log_plain(self, message):
         self.write_log_line(message)
