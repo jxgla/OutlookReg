@@ -130,7 +130,7 @@ def _login_and_get_token(page, email, password, prefix='', failure_hook=None, lo
 
     返回: (True, refresh_token, recovery_session) 或 (False, None, recovery_session)
     """
-    from controllers.oauth2 import _handle_protect_account, _handle_proof_verify, _handle_kmsi
+    from controllers.oauth2 import _handle_auth_entry_state, _finalize_oauth_flow
     # NEW 路径：OAuth 强制交互登录，避免静默吃本机/浏览器账号态
     auth_url = build_auth_url(login_hint=email)
     captured_code = [None]
@@ -155,27 +155,18 @@ def _login_and_get_token(page, email, password, prefix='', failure_hook=None, lo
         state = _wait_for_auth_entry_state(page, timeout_ms=AUTH_ENTRY_TIMEOUT_MS)
         _log('entry', f'首次检测状态={state}')
 
-        if state == 'account_type':
-            state = _resolve_account_type(page, _log, captured_code=captured_code, observer=observer)
-            _log('entry', f'帐户类型处理后状态={state}')
-        if state == 'protect_account':
-            state, new_recovery_session = _handle_protect_account(
-                page, _log, temp_mail_cfg=temp_mail_cfg, failure_hook=failure_hook,
-                already_bound=recovery_already_bound, current_email_local=(str(email or '').split('@', 1)[0]).strip(),
-            )
-            if new_recovery_session:
-                recovery_session = new_recovery_session
-                recovery_already_bound = True
-            _log('entry', f'保护帐户处理后状态={state}')
-        if state == 'proof_verify':
-            state = _handle_proof_verify(
-                page, _log, temp_mail_cfg=temp_mail_cfg,
-                recovery_session=recovery_session, failure_hook=failure_hook, captured_code=captured_code,
-            )
-            _log('entry', f'proof 验证后状态={state}')
-        if state == 'kmsi':
-            state = _handle_kmsi(page, _log)
-            _log('entry', f'kmsi 处理后状态={state}')
+        state, recovery_session, recovery_already_bound = _handle_auth_entry_state(
+            page,
+            _log,
+            state,
+            captured_code=captured_code,
+            temp_mail_cfg=temp_mail_cfg,
+            failure_hook=failure_hook,
+            recovery_already_bound=recovery_already_bound,
+            recovery_session=recovery_session,
+            current_email_local=(str(email or '').split('@', 1)[0]).strip(),
+            observer=observer,
+        )
         if state == 'unknown' and _is_login_email_page_loose(page):
             state = 'login_email'
             _log('entry', 'unknown 实为邮箱登录页：同页补登当前邮箱', 'WARN')
@@ -212,57 +203,33 @@ def _login_and_get_token(page, email, password, prefix='', failure_hook=None, lo
                 return True, refresh_token, recovery_session
             # 登录后可能刚到 consent / 又弹出帐户类型 / 保护帐户 / proof
             state = _wait_for_auth_entry_state(page, timeout_ms=8000)
-            if state == 'account_type':
-                state = _resolve_account_type(page, _log, captured_code=captured_code, observer=observer)
-            if state == 'protect_account':
-                state, new_recovery_session = _handle_protect_account(
-                    page, _log, temp_mail_cfg=temp_mail_cfg, failure_hook=failure_hook,
-                    already_bound=recovery_already_bound, current_email_local=(str(email or '').split('@', 1)[0]).strip(),
-                )
-                if new_recovery_session:
-                    recovery_session = new_recovery_session
-                    recovery_already_bound = True
-            if state == 'proof_verify':
-                state = _handle_proof_verify(
-                    page, _log, temp_mail_cfg=temp_mail_cfg,
-                    recovery_session=recovery_session, failure_hook=failure_hook, captured_code=captured_code,
-                )
-            if state == 'kmsi':
-                state = _handle_kmsi(page, _log)
+            state, recovery_session, recovery_already_bound = _handle_auth_entry_state(
+                page,
+                _log,
+                state,
+                captured_code=captured_code,
+                temp_mail_cfg=temp_mail_cfg,
+                failure_hook=failure_hook,
+                recovery_already_bound=recovery_already_bound,
+                recovery_session=recovery_session,
+                current_email_local=(str(email or '').split('@', 1)[0]).strip(),
+                observer=observer,
+            )
             _log('entry', f'登录后阶段={state}')
 
-        if state == 'code' and captured_code[0]:
-            ok, refresh_token = _exchange_captured_code(
-                page,
-                captured_code,
-                _log,
-                failure_hook=failure_hook,
-                current_proxy=current_proxy,
-                token_proxy_getter=token_proxy_getter,
-            )
-            if not ok:
-                return False, None, recovery_session
+        ok, refresh_token = _finalize_oauth_flow(
+            page,
+            _log,
+            state,
+            captured_code,
+            failure_hook=failure_hook,
+            current_proxy=current_proxy,
+            token_proxy_getter=token_proxy_getter,
+            observer=observer,
+        )
+        if ok:
             _log('token', 'token获取成功!', 'OK')
             return True, refresh_token, recovery_session
-
-        if state == 'consent':
-            ok, refresh_token = _click_consent_and_exchange(
-                page,
-                captured_code,
-                _log,
-                failure_hook=failure_hook,
-                current_proxy=current_proxy,
-                token_proxy_getter=token_proxy_getter,
-            )
-            if not ok:
-                return False, None, recovery_session
-            _log('token', 'token获取成功!', 'OK')
-            return True, refresh_token, recovery_session
-
-        if failure_hook:
-            failure_hook('oauth_consent_fail')
-        _dump_auth_page(page, _log, observer=observer)
-        _log('entry', f'未进入同意或登录页面，最终状态={state}', 'FAIL')
         return False, None, recovery_session
 
     except Exception as e:

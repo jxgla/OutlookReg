@@ -226,16 +226,80 @@ def _text_exists(page, text):
     return D.text_exists(page, text)
 
 
+def _password_input_meta(item):
+    try:
+        visible = item.states.is_displayed
+    except Exception:
+        visible = False
+    try:
+        meta = item.run_js(
+            """function() {
+                const el = this;
+                const cls = (el.className && el.className.toString) ? el.className.toString() : '';
+                return {
+                    id: el.id || '',
+                    name: el.name || '',
+                    type: el.getAttribute('type') || '',
+                    tabindex: el.getAttribute('tabindex') || '',
+                    ariaHidden: el.getAttribute('aria-hidden') || '',
+                    readonly: el.hasAttribute('readonly'),
+                    disabled: !!el.disabled,
+                    cls,
+                    off: !!(el.classList && el.classList.contains('moveOffScreen')),
+                    hidden: !!(el.hidden || el.getAttribute('aria-hidden') === 'true'),
+                    width: el.offsetWidth || 0,
+                    height: el.offsetHeight || 0,
+                };
+            }"""
+        ) or {}
+    except Exception:
+        meta = {}
+    meta['visible'] = bool(visible)
+    return meta
+
+
+def _is_usable_password_input(item):
+    meta = _password_input_meta(item)
+    if not meta.get('visible'):
+        return False
+    if meta.get('hidden') or meta.get('disabled'):
+        return False
+    cls = str(meta.get('cls') or '').lower()
+    if meta.get('off') or 'moveoffscreen' in cls or 'move-off-screen' in cls:
+        return False
+    if str(meta.get('ariaHidden') or '').lower() == 'true':
+        return False
+    width = int(meta.get('width') or 0)
+    height = int(meta.get('height') or 0)
+    if width < 4 or height < 4:
+        return False
+    if str(meta.get('tabindex')) == '-1' and width < 20:
+        return False
+    return True
+
+
 def _password_input(page):
-    """密码框：中英 accessible name + 常见 id。返回元素或 None。"""
+    """密码框：优先真正可交互的输入框，跳过 moveOffScreen / aria-hidden 预填桩。"""
+    selectors = (
+        '#passwordEntry',
+        'input[name="passwd"]',
+        'input[type="password"]',
+        '#i0118',
+    )
+    for sel in selectors:
+        try:
+            for item in D.q_all(page, sel):
+                if _is_usable_password_input(item):
+                    return item
+        except Exception:
+            pass
     for name in ("密码", "Password", "password"):
-        el = D.q(page, f'xpath://input[@type="password" and (@aria-label="{name}" or @placeholder="{name}" or @name="{name}")]')
-        if el and D._displayed(el):
-            return el
-    for sel in ("#passwordEntry", "#i0118", 'input[type="password"]'):
-        el = D.q(page, sel)
-        if el and D._displayed(el):
-            return el
+        try:
+            el = D.q(page, f'xpath://input[@type="password" and (@aria-label="{name}" or @placeholder="{name}" or @name="{name}")]')
+            if el and _is_usable_password_input(el):
+                return el
+        except Exception:
+            pass
     return None
 
 
@@ -874,28 +938,8 @@ def _describe_password_candidates(page):
             count = len(items)
             rows = []
             for idx, item in enumerate(items):
-                try:
-                    visible = item.states.is_displayed
-                except Exception as exc:
-                    visible = f"err:{exc.__class__.__name__}"
-                try:
-                    meta = item.run_js(
-                        """function() {
-                            const el = this;
-                            return {
-                                id: el.id || '',
-                                name: el.name || '',
-                                type: el.getAttribute('type') || '',
-                                tabindex: el.getAttribute('tabindex') || '',
-                                ariaHidden: el.getAttribute('aria-hidden') || '',
-                                readonly: el.hasAttribute('readonly'),
-                                disabled: !!el.disabled
-                            };
-                        }"""
-                    )
-                except Exception:
-                    meta = {}
-                rows.append(f"{idx}:visible={visible},meta={meta}")
+                meta = _password_input_meta(item)
+                rows.append(f"{idx}:usable={_is_usable_password_input(item)},meta={meta}")
             parts.append(f"{selector} count={count} [{' ; '.join(rows)}]")
         except Exception:
             parts.append(f"{selector} error")
@@ -908,14 +952,18 @@ def _password_locator(page, log, timeout_ms=15000):
     while time.time() < deadline:
         _click_use_password(page)
         _dismiss_passkey_login_prompt(page, log=log)
-        for selector in ('#passwordEntry', '#i0118', 'input[type="password"]'):
+        for selector in ('#passwordEntry', '#i0118', 'input[type="password"]', 'input[name="passwd"]'):
             for idx, item in enumerate(D.q_all(page, selector)):
                 try:
-                    if item.states.is_displayed:
+                    if _is_usable_password_input(item):
                         log('oauth_password', f"使用密码框 {selector}[{idx}]", 'INFO')
                         return item, f"{selector}[{idx}]"
                 except Exception:
                     continue
+        item = _password_input(page)
+        if item is not None:
+            log('oauth_password', '使用密码框 fallback:_password_input', 'INFO')
+            return item, 'fallback:_password_input'
         last_snapshot = _describe_password_candidates(page)
         page.wait(0.3)
     raise RuntimeError(f"未找到可见密码框：{last_snapshot}")
@@ -1405,6 +1453,65 @@ def _exchange_code_with_retry(code, log, failure_hook=None, current_proxy="", to
     return False, None
 
 
+def _handle_auth_entry_state(
+    page, log, state, captured_code=None, temp_mail_cfg=None,
+    failure_hook=None, recovery_already_bound=False, recovery_session=None,
+    current_email_local='', observer=None,
+):
+    if state == 'account_type':
+        state = _resolve_account_type(page, log, captured_code=captured_code, observer=observer)
+        log('entry', f'帐户类型处理后状态={state}')
+    if state == 'protect_account':
+        state, new_recovery_session = _handle_protect_account(
+            page, log, temp_mail_cfg=temp_mail_cfg, failure_hook=failure_hook,
+            already_bound=recovery_already_bound, current_email_local=current_email_local,
+        )
+        if new_recovery_session:
+            recovery_session = new_recovery_session
+            recovery_already_bound = True
+        log('entry', f'保护帐户处理后状态={state}')
+    if state == 'proof_verify':
+        state = _handle_proof_verify(
+            page, log, temp_mail_cfg=temp_mail_cfg,
+            recovery_session=recovery_session, failure_hook=failure_hook,
+            captured_code=captured_code,
+        )
+        log('entry', f'proof 验证后状态={state}')
+    if state == 'kmsi':
+        state = _handle_kmsi(page, log)
+        log('entry', f'kmsi 处理后状态={state}')
+    return state, recovery_session, recovery_already_bound
+
+
+def _finalize_oauth_flow(
+    page, log, state, captured_code, failure_hook=None,
+    current_proxy='', token_proxy_getter=None, observer=None,
+):
+    if state == 'code':
+        return _exchange_captured_code(
+            page,
+            captured_code,
+            log,
+            failure_hook=failure_hook,
+            current_proxy=current_proxy,
+            token_proxy_getter=token_proxy_getter,
+        )
+    if state == 'consent':
+        return _click_consent_and_exchange(
+            page,
+            captured_code,
+            log,
+            failure_hook=failure_hook,
+            current_proxy=current_proxy,
+            token_proxy_getter=token_proxy_getter,
+        )
+    if failure_hook:
+        failure_hook('oauth_consent_fail')
+    _dump_auth_page(page, log, observer=observer)
+    log('entry', f'未进入同意或登录页面，最终状态={state}', 'FAIL')
+    return False, None
+
+
 def _click_consent_and_exchange(page, captured_code, log, failure_hook=None, current_proxy="", token_proxy_getter=None):
     # 点同意前先开监听，确保抓到跳转 localhost 的回调
     D.start_code_listen(page)
@@ -1484,28 +1591,18 @@ def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', ba
             state = _wait_for_auth_state_or_code(pg, captured_code, timeout_ms=AUTH_ENTRY_TIMEOUT_MS)
             _log('entry', f'首次检测状态={state}')
 
-            if state == 'account_type':
-                state = _resolve_account_type(pg, _log, captured_code=captured_code, observer=observer)
-                _log('entry', f'帐户类型处理后状态={state}')
-            if state == 'protect_account':
-                state, new_recovery_session = _handle_protect_account(
-                    pg, _log, temp_mail_cfg=temp_mail_cfg, failure_hook=failure_hook,
-                    already_bound=flow_recovery_already_bound, current_email_local=current_email_local,
-                )
-                if new_recovery_session:
-                    flow_recovery_session = new_recovery_session
-                    flow_recovery_already_bound = True
-                _log('entry', f'保护帐户处理后状态={state}')
-            if state == 'proof_verify':
-                state = _handle_proof_verify(
-                    pg, _log, temp_mail_cfg=temp_mail_cfg,
-                    recovery_session=flow_recovery_session, failure_hook=failure_hook,
-                    captured_code=captured_code,
-                )
-                _log('entry', f'proof 验证后状态={state}')
-            if state == 'kmsi':
-                state = _handle_kmsi(pg, _log)
-                _log('entry', f'kmsi 处理后状态={state}')
+            state, flow_recovery_session, flow_recovery_already_bound = _handle_auth_entry_state(
+                pg,
+                _log,
+                state,
+                captured_code=captured_code,
+                temp_mail_cfg=temp_mail_cfg,
+                failure_hook=failure_hook,
+                recovery_already_bound=flow_recovery_already_bound,
+                recovery_session=flow_recovery_session,
+                current_email_local=current_email_local,
+                observer=observer,
+            )
 
             # 策略：有 cookie 的环境下，login_email 时**不要**连环 reload（会冲掉 SSO）。
             if state == 'login_email':
@@ -1513,22 +1610,13 @@ def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', ba
             elif state == 'unknown':
                 _dump_auth_page(pg, _log, 'entry_unknown', observer=observer)
                 if _is_account_type_page(pg):
-                    state = _resolve_account_type(pg, _log, captured_code=captured_code, observer=observer)
+                    state = 'account_type'
                 elif _is_protect_account_page(pg):
-                    state, new_recovery_session = _handle_protect_account(
-                        pg, _log, temp_mail_cfg=temp_mail_cfg, failure_hook=failure_hook,
-                        already_bound=flow_recovery_already_bound, current_email_local=current_email_local,
-                    )
-                    if new_recovery_session:
-                        flow_recovery_session = new_recovery_session
-                        flow_recovery_already_bound = True
+                    state = 'protect_account'
                 elif _is_proof_verify_page(pg):
-                    state = _handle_proof_verify(
-                        pg, _log, temp_mail_cfg=temp_mail_cfg,
-                        recovery_session=flow_recovery_session, failure_hook=failure_hook,
-                    )
+                    state = 'proof_verify'
                 elif _is_kmsi_only_page(pg):
-                    state = _handle_kmsi(pg, _log)
+                    state = 'kmsi'
                 elif _is_login_email_page_loose(pg):
                     state = 'login_email'
                     _log('entry', 'unknown 实为邮箱登录页：同页补登当前邮箱', 'WARN')
@@ -1543,26 +1631,32 @@ def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', ba
                             _log('entry', 'goto 后识别为邮箱登录页：同页补登当前邮箱', 'WARN')
                     except Exception as exc:
                         _log('entry', f'goto 重试失败: {_compact_exc(exc)}', 'WARN')
+                state, flow_recovery_session, flow_recovery_already_bound = _handle_auth_entry_state(
+                    pg,
+                    _log,
+                    state,
+                    captured_code=captured_code,
+                    temp_mail_cfg=temp_mail_cfg,
+                    failure_hook=failure_hook,
+                    recovery_already_bound=flow_recovery_already_bound,
+                    recovery_session=flow_recovery_session,
+                    current_email_local=current_email_local,
+                    observer=observer,
+                )
                 _log('entry', f'处理后状态={state}')
 
-            if state == 'account_type':
-                state = _resolve_account_type(pg, _log, captured_code=captured_code, observer=observer)
-            if state == 'protect_account':
-                state, new_recovery_session = _handle_protect_account(
-                    pg, _log, temp_mail_cfg=temp_mail_cfg, failure_hook=failure_hook,
-                    already_bound=flow_recovery_already_bound, current_email_local=current_email_local,
-                )
-                if new_recovery_session:
-                    flow_recovery_session = new_recovery_session
-                    flow_recovery_already_bound = True
-            if state == 'proof_verify':
-                state = _handle_proof_verify(
-                    pg, _log, temp_mail_cfg=temp_mail_cfg,
-                    recovery_session=flow_recovery_session, failure_hook=failure_hook,
-                    captured_code=captured_code,
-                )
-            if state == 'kmsi':
-                state = _handle_kmsi(pg, _log)
+            state, flow_recovery_session, flow_recovery_already_bound = _handle_auth_entry_state(
+                pg,
+                _log,
+                state,
+                captured_code=captured_code,
+                temp_mail_cfg=temp_mail_cfg,
+                failure_hook=failure_hook,
+                recovery_already_bound=flow_recovery_already_bound,
+                recovery_session=flow_recovery_session,
+                current_email_local=current_email_local,
+                observer=observer,
+            )
 
             if state in ('login_email', 'login_password', 'account_type', 'protect_account', 'proof_verify', 'kmsi'):
                 ok, flow_recovery_session = _perform_login_after_cookie_fail(
@@ -1586,32 +1680,17 @@ def get_oauth2_token(page, full_email, password, results_dir=None, prefix='', ba
                 )
                 _log('entry', f'登录后阶段={state}', 'INFO')
 
-            if state == 'code':
-                ok, token = _exchange_captured_code(
-                    pg,
-                    captured_code,
-                    _log,
-                    failure_hook=failure_hook,
-                    current_proxy=current_proxy,
-                    token_proxy_getter=token_proxy_getter,
-                )
-                return ok, token, flow_recovery_session
-            if state == 'consent':
-                ok, token = _click_consent_and_exchange(
-                    pg,
-                    captured_code,
-                    _log,
-                    failure_hook=failure_hook,
-                    current_proxy=current_proxy,
-                    token_proxy_getter=token_proxy_getter,
-                )
-                return ok, token, flow_recovery_session
-
-            if failure_hook:
-                failure_hook('oauth_consent_fail')
-            _dump_auth_page(pg, _log, observer=observer)
-            _log('entry', f'未进入同意或登录页面，最终状态={state}', 'FAIL')
-            return False, None, flow_recovery_session
+            ok, token = _finalize_oauth_flow(
+                pg,
+                _log,
+                state,
+                captured_code,
+                failure_hook=failure_hook,
+                current_proxy=current_proxy,
+                token_proxy_getter=token_proxy_getter,
+                observer=observer,
+            )
+            return ok, token, flow_recovery_session
         except Exception as e:
             _log('exception', f'异常: {_compact_exc(e)}', 'FAIL')
             return False, None, flow_recovery_session
