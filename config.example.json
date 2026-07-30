@@ -72,9 +72,9 @@
     "port_end": 0,
     // 单端口进程内最多被选中次数；用满暂不选，全满/批次重置后计数清零
     "max_per_proxy": 20,
-    // pool 模式：行内未写 scheme 时的默认协议（一般 socks5）
+    // pool 模式：行内未写 scheme 时的默认协议（一般 socks5；行内带 http:// 或 socks5:// 时直接使用行内协议）
     "pool_type": "socks5",
-    // pool 模式：代理清单文件（与 config.json 同级），每行一条，支持 user:pass@host:port
+    // pool 模式：代理清单文件（与 config.json 同级），每行一条；支持 host:port、host:port:user:pass、user:pass@host:port，以及带 http:// / socks5:// 前缀的同类格式
     "pool_file": "proxypool.txt",
     // pool 模式：前置出墙代理（墙内填本地 7897 等；墙外可留 "" = 直连）
     "front_proxy": "http://127.0.0.1:7897"

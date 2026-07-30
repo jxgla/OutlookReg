@@ -109,6 +109,23 @@ Ship template: `config.example.json` (same shape as the empty `config.json`). Bo
 | `port_start` | number | First port when `mode` is `multiple`. |
 | `port_end` | number | Last port when `mode` is `multiple` (inclusive). |
 | `max_per_proxy` | number | Max times a port may be selected before it is skipped (usage counters reset when all ports are exhausted or a batch resets). |
+| `pool_type` | string | Default scheme used by `mode=pool` when a `pool_file` line does not include one, e.g. `http`, `socks5`. |
+| `pool_file` | string | Proxy list file used by `mode=pool`; relative paths are resolved next to `config.json`. |
+| `front_proxy` | string | Front proxy used by `mode=pool`; use something like local `http://127.0.0.1:7897` when needed, or leave empty for direct upstream dialing. |
+
+`pool_file` uses one proxy per line. Empty lines and lines starting with `#` are skipped. Supported formats:
+
+```text
+host:port
+host:port:user:pass
+user:pass@host:port
+http://host:port
+http://user:pass@host:port
+socks5://host:port
+socks5://user:pass@host:port
+```
+
+If a line already starts with `http://` or `socks5://`, that scheme is used as-is and `pool_type` is not prepended again. `pool_type` is only used for lines without an explicit scheme.
 
 ### `oauth2`
 

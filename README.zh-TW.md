@@ -109,6 +109,23 @@ python main.py
 | `port_start` | number | `mode=multiple` 時起始連接埠。 |
 | `port_end` | number | `mode=multiple` 時結束連接埠（含）。 |
 | `max_per_proxy` | number | 單一連接埠在行程內最多被選中次數；用滿後暫不選，全滿或批次重置後計數清零。 |
+| `pool_type` | string | `mode=pool` 且 `pool_file` 行內未寫協定時使用的預設協定，如 `http`、`socks5`。 |
+| `pool_file` | string | `mode=pool` 時的代理清單檔案；相對路徑按 `config.json` 同級目錄解析。 |
+| `front_proxy` | string | `mode=pool` 時的前置出牆代理；牆內可填本地 `http://127.0.0.1:7897`，牆外直連可留空。 |
+
+`pool_file` 每行一條代理，空行和 `#` 開頭的註解會跳過。支援以下格式：
+
+```text
+host:port
+host:port:user:pass
+user:pass@host:port
+http://host:port
+http://user:pass@host:port
+socks5://host:port
+socks5://user:pass@host:port
+```
+
+如果行內已經帶 `http://` 或 `socks5://`，會直接使用行內協定，不會再額外拼接 `pool_type`，避免出現重複協定前綴。行內未寫協定時，才使用 `pool_type` 作為預設協定。
 
 ### `oauth2`
 

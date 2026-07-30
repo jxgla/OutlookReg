@@ -119,6 +119,23 @@ python main.py
 | `port_start` | number | `mode=multiple` 时起始端口。 |
 | `port_end` | number | `mode=multiple` 时结束端口（含）。 |
 | `max_per_proxy` | number | 单个端口在进程内最多被选中次数；用满后暂不选，全满或批次重置后计数清零。 |
+| `pool_type` | string | `mode=pool` 且 `pool_file` 行内未写协议时使用的默认协议，如 `http`、`socks5`。 |
+| `pool_file` | string | `mode=pool` 时的代理清单文件；相对路径按 `config.json` 同级目录解析。 |
+| `front_proxy` | string | `mode=pool` 时的前置出墙代理；墙内可填本地 `http://127.0.0.1:7897`，墙外直连可留空。 |
+
+`pool_file` 每行一条代理，空行和 `#` 开头的注释会跳过。支持以下格式：
+
+```text
+host:port
+host:port:user:pass
+user:pass@host:port
+http://host:port
+http://user:pass@host:port
+socks5://host:port
+socks5://user:pass@host:port
+```
+
+如果行内已经带 `http://` 或 `socks5://`，会直接使用行内协议，不会再额外拼接 `pool_type`，避免出现重复协议前缀。行内未写协议时，才使用 `pool_type` 作为默认协议。
 
 ### `oauth2`
 
