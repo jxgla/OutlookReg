@@ -7,6 +7,7 @@ import math
 import shutil
 import threading
 from faker import Faker
+from DrissionPage.common import Keys
 
 from controllers import dp_page as D
 from controllers.proxy_pool import ProxyPool, LocalForwarder
@@ -830,6 +831,95 @@ class OutlookController:
     # ============================================================
     # 注册流程
     # ============================================================
+    @staticmethod
+    def _form_pause(page, lower_ms, upper_ms):
+        page.wait(random.uniform(lower_ms, upper_ms) / 1000)
+
+    def _form_human_click(self, page, element, jitter=1.0,
+                          pre_delay=(150, 400), post_delay=(100, 250)):
+        """用随机停顿和真实指针事件点击表单元素。"""
+        box = D.viewport_box(element)
+        if not box:
+            try:
+                element.click()
+            except Exception:
+                return False
+            self._form_pause(page, *post_delay)
+            return True
+
+        x = box['x'] + box['width'] / 2 + random.uniform(-jitter, jitter)
+        y = box['y'] + box['height'] / 2 + random.uniform(-jitter, jitter)
+        D.mouse_move(page, x, y, buttons=0)
+        self._form_pause(page, *pre_delay)
+        D.mouse_press(page, x, y)
+        self._form_pause(page, 60, 130)
+        D.mouse_release(page, x, y)
+        self._form_pause(page, *post_delay)
+        return True
+
+    def _form_human_type(self, page, element, text):
+        """逐字符发送 keydown/keyup，并复用 outlook-re 的随机输入节奏。"""
+        if not self._form_human_click(page, element):
+            return False
+        try:
+            element.clear()
+        except Exception:
+            pass
+
+        self._form_pause(page, 250, 600)
+        for index, char in enumerate(str(text)):
+            page.actions.key_down(char)
+            self._form_pause(page, 40, 90)
+            page.actions.key_up(char)
+
+            if random.random() < 0.02:
+                self._form_pause(page, 500, 1400)
+            elif random.random() < 0.10:
+                self._form_pause(page, 200, 350)
+            else:
+                self._form_pause(page, 70, 160)
+
+            if random.random() < 0.015 and index > 2:
+                page.actions.type(Keys.BACKSPACE)
+                self._form_pause(page, 80, 160)
+                page.actions.key_down(char)
+                self._form_pause(page, 40, 80)
+                page.actions.key_up(char)
+                self._form_pause(page, 120, 250)
+
+        self._form_pause(page, 200, 500)
+        return True
+
+    def _form_click_sel(self, page, selector, timeout=5):
+        element = D.q(page, selector, timeout=timeout)
+        return self._form_human_click(page, element) if element else False
+
+    def _form_pick_birth(self, page, name, index):
+        """按 outlook-re 的键盘导航方式选择生日下拉项。"""
+        element = D.q(page, f'[role="combobox"][name="{name}"]', timeout=3)
+        if not element:
+            element = D.q(page, f'[name="{name}"]', timeout=10)
+        if not element or not self._form_human_click(page, element):
+            return False
+
+        try:
+            page.wait(0.6)
+            page.actions.type(Keys.HOME)
+            page.wait(0.15)
+            for _ in range(index - 1):
+                page.actions.type(Keys.DOWN)
+                self._form_pause(page, 60, 110)
+            page.actions.type(Keys.ENTER)
+            page.wait(0.35)
+            return True
+        except Exception:
+            try:
+                element.select.by_value(str(index))
+                self._form_pause(page, 300, 700)
+                return True
+            except Exception:
+                return False
+
     def outlook_register(self, page, email, password):
         """
         完整的Outlook注册流程。
@@ -858,7 +948,6 @@ class OutlookController:
             page.get('https://outlook.live.com/mail/0/?prompt=create_account')
             if not D.q(page, 'text:同意并继续', timeout=30):
                 raise TimeoutError('agree button not found')
-            start_time = time.time()
             page.wait(0.1 * self.wait_time / 1000)
             D.click_sel(page, 'text:同意并继续', timeout=30)
         except Exception:
@@ -870,71 +959,64 @@ class OutlookController:
             D.disable_autofill(page)
             # 选择是 outlook还是hotmail
             if self.email_suffix == "@hotmail.com":
-                D.click_sel(page, 'text:@outlook.com', timeout=10)
+                self._form_click_sel(page, 'text:@outlook.com', timeout=10)
                 opt = D.q(page, 'xpath://*[@role="option" and normalize-space(.)="@hotmail.com"]', timeout=5)
                 if opt:
-                    opt.click()
+                    self._form_human_click(page, opt)
 
-            # 填充邮箱
+            # 填充邮箱（逐字符输入）
             email_input = page.ele('css:[aria-label="新建电子邮件"]', timeout=10)
-            email_input.click()
-            email_input.input(email, clear=True)
+            if not self._form_human_type(page, email_input, email):
+                raise RuntimeError('email form input failed')
 
-            # 点击 "下一步
-            D.click_sel(page, '[data-testid="primaryButton"]', timeout=5)
-            page.wait(0.02 * self.wait_time / 1000)
+            # 点击“下一步”
+            self._form_pause(page, 800, 1500)
+            if not self._form_click_sel(page, '[data-testid="primaryButton"]', timeout=5):
+                raise RuntimeError('email next button not found')
 
-            # 填充密码（真实输入）
+            # 填充密码（逐字符输入）
             pwd_input = page.ele('css:[type="password"]', timeout=10)
-            pwd_input.input(password, clear=True)
-            page.wait(0.02 * self.wait_time / 1000)
+            if not self._form_human_type(page, pwd_input, password):
+                raise RuntimeError('password form input failed')
 
-            # 点击 "下一步
-            D.click_sel(page, '[data-testid="primaryButton"]', timeout=5)
-            page.wait(0.03 * self.wait_time / 1000)
+            # 点击“下一步”
+            self._form_pause(page, 800, 1600)
+            if not self._form_click_sel(page, '[data-testid="primaryButton"]', timeout=5):
+                raise RuntimeError('password next button not found')
 
-            # 填充出生的年份
-            D.fill_sel(page, '[name="BirthYear"]', year, timeout=10)
+            # 填充出生日期（键盘导航）
+            if not self._form_pick_birth(page, 'BirthMonth', int(month)):
+                raise RuntimeError('birth month form input failed')
+            self._form_pause(page, 300, 700)
+            if not self._form_pick_birth(page, 'BirthDay', int(day)):
+                raise RuntimeError('birth day form input failed')
+            self._form_pause(page, 300, 700)
 
-            # 填充出生日期,实际上不会走 try，走的是Except。因为 有浮层的存在，
-            try:
-                # 填充月份
-                page.wait(0.02 * self.wait_time / 1000)
-                page.ele('css:[name="BirthMonth"]', timeout=1).select.by_value(month)
+            # 填充出生年份
+            year_input = page.ele('css:[name="BirthYear"]', timeout=10)
+            if not self._form_human_type(page, year_input, year):
+                raise RuntimeError('birth year form input failed')
 
-                # 填充日期
-                page.wait(0.05 * self.wait_time / 1000)
-                page.ele('css:[name="BirthDay"]', timeout=1).select.by_value(day)
-            except Exception:
+            # 提交生日
+            self._form_pause(page, 900, 1800)
+            if not self._form_click_sel(page, '[data-testid="primaryButton"]', timeout=5):
+                raise RuntimeError('birth next button not found')
 
-                # 填充月份
-                D.click_sel(page, '[name="BirthMonth"]', timeout=5)
-                page.wait(0.02 * self.wait_time / 1000)
-                mo = D.q(page, f'xpath://*[@role="option" and normalize-space(.)="{month}月"]', timeout=5)
-                if mo:
-                    mo.click()
-                page.wait(0.04 * self.wait_time / 1000)
+            # 填充姓氏和名字
+            lastname_input = page.ele('css:#lastNameInput', timeout=10)
+            if not self._form_human_type(page, lastname_input, lastname):
+                raise RuntimeError('last name form input failed')
+            self._form_pause(page, 400, 900)
 
-                # 填充日期
-                D.click_sel(page, '[name="BirthDay"]', timeout=5)
-                page.wait(0.03 * self.wait_time / 1000)
-                da = D.q(page, f'xpath://*[@role="option" and normalize-space(.)="{day}日"]', timeout=5)
-                if da:
-                    da.click()
-                D.click_sel(page, '[data-testid="primaryButton"]', timeout=5)
+            firstname_input = page.ele('css:#firstNameInput', timeout=10)
+            if not self._form_human_type(page, firstname_input, firstname):
+                raise RuntimeError('first name form input failed')
+            self._form_pause(page, 800, 1600)
 
-            # 填充姓氏
-            D.fill_sel(page, '#lastNameInput', lastname, timeout=10)
-            page.wait(0.02 * self.wait_time / 1000)
+            # 点击“下一步”
+            if not self._form_click_sel(page, '[data-testid="primaryButton"]', timeout=5):
+                raise RuntimeError('name next button not found')
 
-            # 填充名字
-            D.fill_sel(page, '#firstNameInput', firstname, timeout=10)
-
-            if time.time() - start_time < self.wait_time / 1000:
-                page.wait((self.wait_time - (time.time() - start_time) * 1000) / 1000)
-
-            # 点击 "下一步
-            D.click_sel(page, '[data-testid="primaryButton"]', timeout=5)
             D.wait_gone(page, 'span > [href="https://go.microsoft.com/fwlink/?LinkID=521839"]', timeout=22)
             page.wait(0.4)
 

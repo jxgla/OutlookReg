@@ -78,7 +78,7 @@ python main.py
 | --- | --- | --- |
 | `email_suffix` | string | 註冊信箱後綴，如 `@outlook.com` 或 `@hotmail.com`。 |
 | `headless` | bool | `false` 顯示瀏覽器視窗；`true` 無頭。 |
-| `bot_protection_wait` | number | 填表節奏基準（秒）。程式內會 ×1000 作為等待。 |
+| `bot_protection_wait` | number | 註冊頁同意按鈕前的等待基準（秒）；表單欄位採用隨機人類化節奏。 |
 | `max_captcha_retries` | number | 驗證碼按壓總嘗試次數（如 `2` = 按壓兩次都不過就棄用當前視窗；single 模式則判定此IP不可用並結束執行）。 |
 | `captcha_strategy` | number | 驗證碼／交接策略，見下表。 |
 | `px_solve_mode` | string | PX「按住」驗證碼解法：`"hold"`（預設，成功率穩定）或 `"a11y"`（無障礙備用：點無障礙小人圖示→等進度條走完→點長條確認）。 |

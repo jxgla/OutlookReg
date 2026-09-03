@@ -78,7 +78,7 @@ Ship template: `config.example.json` (same shape as the empty `config.json`). Bo
 | --- | --- | --- |
 | `email_suffix` | string | Mail domain suffix used when generating accounts, e.g. `@outlook.com` or `@hotmail.com`. |
 | `headless` | bool | `false` = show browser windows; `true` = headless. |
-| `bot_protection_wait` | number | Base pacing for form fill (seconds). Code multiplies by 1000 for delays. |
+| `bot_protection_wait` | number | Pre-agreement page pacing baseline (seconds); form fields use randomized human-like timing. |
 | `max_captcha_retries` | number | Total press-and-hold attempts for the captcha (e.g. `2` = after two failed holds the current window is dropped; in `single` proxy mode the run ends, marking the IP unusable). |
 | `captcha_strategy` | number | Captcha / handoff mode (see table below). |
 | `px_solve_mode` | string | PerimeterX press-and-hold solver: `"hold"` (default, steady success rate) or `"a11y"` (accessibility fallback: click the accessibility icon → let the progress bar fill → click the bar). |
